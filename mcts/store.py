@@ -186,6 +186,14 @@ class StateStore:
             )
             self._conn.commit()
 
+    def clear_instance(self, instance_id: str) -> None:
+        """删除某实例全部行（force rerun / --no-resume 语义：从零开始）。"""
+        with self._write_lock:
+            for table in ("rollouts", "nodes", "tree_instances"):
+                self._conn.execute(
+                    f"DELETE FROM {table} WHERE instance_id=?", (instance_id,))
+            self._conn.commit()
+
     # ------------------------------------------------------------------
     # 节点（nodes）—— 事实随时落；判定（in_pool）只随会话提交
     # ------------------------------------------------------------------

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: BSD-3-Clause
+﻿# SPDX-License-Identifier: BSD-3-Clause
 
 """任务驱动高并发 MCTS 引擎（PLAN §2.3–2.4 / 设计文档 docs/mcts_engine_design.md）。
 
@@ -34,8 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
-from mcts.locate import annotation_entry, locate_error
-from mcts.node import MCTSNode, select_best_node
+from mcts.locate import locate_error
+from mcts.node import MCTSNode, compute_q_value, compute_u_value
 from mcts.steps import Step, messages_for_prefix, prefix_node_key, steps_to_messages
 
 logger = logging.getLogger("mcts.tasks")
@@ -480,13 +480,15 @@ class Worker:
 
 
 class TreeDriver:
-    """单实例的 MCTS 全流程：root rollout → MC 门控 → select/locate 标注循环。
+    """单实例 MCTS 会话式驱动（v5，docs/construction/03_init_and_resume.md / 04_tree_execution.md）。
 
-    与 ReARTeR ``gen_data_Step_RFT.py`` + ``module.py::process_annotations`` 对应，
-    但 rollout 经任务队列并发执行（probe 节点 N 次 rollout 同时进行）。
-
-    **树结构与 rollout 结果常驻内存**；SQLite（``StateStore``）作为崩溃安全镜像：
-    rollout 完成即 upsert、树节点定期快照、实例状态与标注落库（断点恢复用）。
+    - **DB 事实权威**：节点/rollout 事实实时落库（节点创建即落、rollout 成功即落）；
+    - **会话即事务**：一次 (select+locate) 的判定（is_consumed / visits / n_rounds /
+      in_pool）经 :meth:`StateStore.commit_session` 单事务原子提交 —— 崩溃中途 =
+      判定未提交 = 该 (node, rollout) 未消费 → resume 重选重做（probe 结果内容寻址复用）；
+    - **恢复**：run() 无 DB 从零注册（not_started + head 即写）；有 DB 整树载入重建；
+      done/failed 跳过；running/budget_exhausted/not_started 续跑；
+    - **池成员**：root + 已提交 in_pool 节点（中断会话的孤儿探针永不入池）。
     """
 
     def __init__(
@@ -517,125 +519,166 @@ class TreeDriver:
         self.n_rollouts = n_rollouts
         self.temperature_range = temperature_range
         self.select_kwargs = select_kwargs or {}
-        self.max_iterations = max_iterations
+        self.rounds_cap = max_iterations
         self.resume = resume
         self.config_file = config_file
-        self.nodes: dict[str, MCTSNode] = {}      # node_key → node（内容寻址）
-        self.leaves: list[MCTSNode] = []
-        self.expanded: list[MCTSNode] = []        # 扩展节点（add 标注 = 这些节点）
-        self.best_entries: list[dict] = []
+        # 内存态（DB 是权威；内存只是运行期镜像/缓存）
+        self.nodes: dict[str, MCTSNode] = {}        # node_key → node（内容寻址）
+        self._rollouts: dict[str, dict[int, RolloutResult]] = {}  # node_key → {idx: result}
+        self._consumed: dict[str, set[int]] = {}    # node_key → 已消费 idx 集（内存镜像）
+        self.pool: list[MCTSNode] = []              # 池 = root + 已提交 in_pool（顺序=入池序）
+        self.rounds = 0                             # 非 root 消费轮数（DB tree.n_rounds 为权威）
         self.status = "running"
-        self._messages_head: list[dict] = []       # system+user 头部（probe 消息拼接用）
-        self._tree_dirty = False                   # 树快照待写标记
+        self._messages_head: list[dict] = []
+        # QU 参数（来自 select_kwargs，默认与 node.py 一致）
+        self._q = {
+            "alpha": self.select_kwargs.get("alpha", 0.5),
+            "beta": self.select_kwargs.get("beta", 0.9),
+            "max_length": self.select_kwargs.get("max_length", 6),
+            "exploration_param": self.select_kwargs.get("exploration_param", 0.125),
+        }
 
     # ------------------------------------------------------------------
-    # 运行入口
+    # 运行入口（注册 / 恢复 / 会话循环）
     # ------------------------------------------------------------------
 
     async def run(self) -> dict:
-        state = self.store.get_instance_status(self.iid)
-        if self.resume and state and state.get("status") in ("done", "failed"):
-            logger.info("%s: skip (status=%s)", self.iid, state["status"])
-            return {"instance_id": self.iid, "status": state["status"], "skipped": True}
-        self.store.set_instance_status(self.iid, "running")
+        tree = self.store.get_tree(self.iid)
+        if tree is None:
+            # 无 DB 从零注册：head 注册即写（不依赖 rollout 轨迹）
+            head = build_messages_head(self.instance, self.config_file)
+            self.store.create_tree(self.iid, head)
+            tree = self.store.get_tree(self.iid)
+        if not self.resume:
+            # 显式强制重跑：清空该实例全部行，从零开始
+            self.store.clear_instance(self.iid)
+            tree = None
+        if tree is not None and tree["status"] in ("done", "failed"):
+            logger.info("%s: skip (status=%s)", self.iid, tree["status"])
+            return {"instance_id": self.iid, "status": tree["status"], "skipped": True}
+        if tree is None:
+            head = build_messages_head(self.instance, self.config_file)
+            self.store.create_tree(self.iid, head)
+            tree = self.store.get_tree(self.iid)
+
+        self.status = "running"
+        self.store.set_tree_status(self.iid, "running")
+        self._messages_head = tree["messages_head"] or []
+        root: Optional[MCTSNode] = None
         try:
-            root = self._get_or_create_node([])
-            await self._perform_rollouts(root, kind="root")
-            # 头部优先从 root 轨迹计算；resume 续跑时 rollout 从 DB 加载
-            # （trajectory=None）算不出 → 回退到落库的 messages_head_json →
-            # 最后用「config 提示词 + 实例原始输入」直接重建（任何实例可还原，
-            # 不再依赖轨迹 / 历史落库，见 build_messages_head）。
-            self._messages_head = (
-                resolve_messages_head(
-                    root.rollouts,
-                    stored_head=(state or {}).get("messages_head"),
-                )
-                or build_messages_head(self.instance, self.config_file)
-            )
-            root.mc_score = root.compute_mc()
-            n_correct = root.correct_count()
-            logger.info("%s: root MC=%.2f (%d/%d)", self.iid, root.mc_score,
-                        n_correct, root.n_rollouts)
+            self._load_tree_state(tree)
+            root = self._get_or_create_node([])      # 内容寻址（root 键 = "root"）
+            if root not in self.pool:
+                self.pool.insert(0, root)
+            await self._ensure_rollouts(root, kind="root")
+            logger.info("%s: root MC=%.2f (%d/%d)", self.iid,
+                        root.mc_score or 0.0, root.correct_count(), root.n_rollouts)
             if root.n_rollouts == 0:
-                # 根节点全部 rollout 失败（无有效数据）→ 实例标记 failed
+                # 根无任何有效 rollout → failed
                 self.status = "failed"
-                self._write_state()
+                self.store.set_tree_status(self.iid, "failed", root_mc=0.0)
                 return {"instance_id": self.iid, "status": "failed",
-                        "root_mc": root.mc_score, "n_nodes": len(self.nodes),
+                        "root_mc": 0.0, "n_nodes": len(self.nodes),
                         "reason": "no valid root rollouts"}
             if root.gated:
                 if self._messages_head:
-                    await self.process_annotations(root)
+                    await self.process_annotations()
                 else:
-                    # 头部（system+user）不可用（历史实例 head 未落库 / 首跑
-                    # root 全部失败）：probe 无法构造合法对话（sglang 400
-                    # "No user query found"）——跳过扩展，保留 root 数据。
-                    logger.warning(
-                        "%s: root MC=%.2f but system+user head unavailable; "
-                        "skipping probe expansion", self.iid, root.mc_score)
+                    # head 不可用（理论不达：注册即写）——跳过扩展保留 root 数据
+                    logger.warning("%s: root MC=%.2f but head unavailable; "
+                                   "skip expansion", self.iid, root.mc_score)
             self.status = "done"
-            self._write_annotations()
-            self._write_state()
+            self.store.set_tree_status(self.iid, "done", root_mc=root.mc_score)
             return {"instance_id": self.iid, "status": "done",
                     "root_mc": root.mc_score, "n_nodes": len(self.nodes),
-                    "n_best": len(self.best_entries), "n_leaves": len(self.leaves)}
+                    "rounds": self.rounds}
         except BudgetExhausted:
             logger.info("%s: budget exhausted; partial data kept", self.iid)
             self.status = "budget_exhausted"
-            self._write_annotations()
-            self._write_state()
+            self.store.set_tree_status(
+                self.iid, "budget_exhausted",
+                root_mc=(root.mc_score if root is not None else None))
             return {"instance_id": self.iid, "status": "budget_exhausted",
-                    "n_nodes": len(self.nodes)}
+                    "n_nodes": len(self.nodes), "rounds": self.rounds}
         except Exception as e:  # noqa: BLE001 - 单实例失败不拖垮整体
             logger.exception("%s: tree failed: %s", self.iid, e)
             self.status = "failed"
-            self._write_state()
+            self.store.set_tree_status(
+                self.iid, "failed",
+                root_mc=(root.mc_score if root is not None else None))
             return {"instance_id": self.iid, "status": "failed", "error": str(e)}
 
     # ------------------------------------------------------------------
-    # 节点 / rollout
+    # 载入（resume / 激活）
+    # ------------------------------------------------------------------
+
+    def _load_tree_state(self, tree: Optional[dict]) -> None:
+        """从 DB 整树载入重建内存（facts：nodes/rollouts/账本/池）。"""
+        state = self.store.load_tree_state(self.iid)
+        self.rounds = int(tree["n_rounds"]) if tree else 0
+        for nk, nrow in state["nodes"].items():          # 按 created_at 顺序
+            node = MCTSNode(instance_id=self.iid, node_key=nk,
+                            prefix_steps=list(nrow["prefix_steps"]))
+            node.visits = nrow["visits"]
+            self.nodes[nk] = node
+            self._rollouts[nk] = {}
+            self._consumed[nk] = set()
+        for nk, rows in state["rollouts"].items():
+            for r in rows:
+                self._rollouts.setdefault(nk, {})[r["rollout_idx"]] = r["result"]
+                if r["is_consumed"]:
+                    self._consumed.setdefault(nk, set()).add(r["rollout_idx"])
+        for nk, node in self.nodes.items():
+            pres = self._rollouts.get(nk)
+            if pres:
+                node.set_rollouts([pres[i] for i in sorted(pres)])
+                node.mc_score = node.compute_mc()        # mc 缓存不信任：重算
+            if nk == "root" or state["nodes"][nk]["in_pool"]:
+                self.pool.append(node)
+
+    # ------------------------------------------------------------------
+    # 节点 / rollout（事实层）
     # ------------------------------------------------------------------
 
     def _get_or_create_node(self, prefix_steps: list[Step]) -> MCTSNode:
         key = prefix_node_key(prefix_steps)
         node = self.nodes.get(key)
         if node is None:
+            self.store.ensure_node(self.iid, key, prefix_steps)   # 创建即落（事实）
             node = MCTSNode(instance_id=self.iid, node_key=key,
                             prefix_steps=list(prefix_steps))
             self.nodes[key] = node
+            self._rollouts[key] = {}
+            self._consumed[key] = set()
         return node
 
-    async def _perform_rollouts(self, node: MCTSNode, kind: str) -> None:
-        """确保节点有 N 次有效 rollout：磁盘缓存复用 + 缺失并发提交 + 等待。
+    async def _ensure_rollouts(self, node: MCTSNode, kind: str) -> None:
+        """确保节点结算：缺槽补跑 + mc 计算 + DB status→ready。
 
-        - 节点已有 N 次有效 rollout 且 mc 已算 → 直接返回（内容寻址节点可能被
-          不同父节点再次探测，复用已有结果，不重复计算）；
-        - resume=True 时先加载磁盘缓存（断点续跑不重跑已完成节点）；
-        - 预算将尽时按 ``Budget.allowed_count`` 部分提交。
+        - 已满 N 槽（成功行数 == N）且 mc 已算 → 直接返回（内容寻址复用）；
+        - 缺槽（含失败/预算部分）→ lazy 补跑（缺什么补什么）；
+        - 失败不落库 → 下次再遇仍缺 → 继续补（"失败 = 没跑过"语义）。
         """
-        if node.n_rollouts >= self.n_rollouts and node.mc_score is not None:
+        present = self._rollouts.get(node.node_key, {})
+        if len(present) >= self.n_rollouts and node.mc_score is not None:
             return
-        # 兜底：probe 需要 system+user 头部拼接合法对话；head 缺失时
-        # （历史实例 head 未落库）不发任务，避免 sglang 400 / 成批失败。
         if kind == "probe" and not self._messages_head:
             logger.warning("%s: probe skipped (head unavailable) node=%s",
                            self.iid, node.node_key)
             return
-        existing = self._load_cached(node.node_key) if self.resume else None
-        if existing is None:
-            existing = [None] * self.n_rollouts
-        missing = [i for i, r in enumerate(existing) if r is None]
+        missing = [i for i in range(self.n_rollouts) if i not in present]
         if missing:
             allowed = self.budget.allowed_count(self.iid, self.stats, len(missing))
             if allowed <= 0:
                 raise BudgetExhausted
-            missing = missing[:allowed]  # 预算将尽时部分提交（节点只跑允许数量的 rollout）
+            missing = missing[:allowed]   # 预算将尽时部分提交
             self.budget.record_submit(self.iid, len(missing))
             self.stats.on_submit(len(missing))
             temperature = random.uniform(*self.temperature_range)
             prefix_messages = None
             if kind == "probe" and node.prefix_steps:
-                prefix_messages = list(self._messages_head) + steps_to_messages(node.prefix_steps)
+                prefix_messages = (list(self._messages_head)
+                                   + steps_to_messages(node.prefix_steps))
             payload = {
                 "instance": self.instance,
                 "prefix_steps": list(node.prefix_steps),
@@ -652,31 +695,28 @@ class TreeDriver:
             ]
             results = await asyncio.gather(*futs)
             for i, res in zip(missing, results):
-                res = res if isinstance(res, RolloutResult) else RolloutResult(
-                    instance_id=self.iid, node_key=node.node_key, rollout_idx=i,
-                    error=f"gather returned {type(res).__name__}",
-                )
+                if not isinstance(res, RolloutResult):
+                    res = RolloutResult(
+                        instance_id=self.iid, node_key=node.node_key,
+                        rollout_idx=i, error=f"gather returned {type(res).__name__}")
                 if res.error is not None:
-                    # 运行中失败自动重跑一次（worker_retries 已兜底多次，树级
-                    # 再重试 1 次；修复 2026-08-31：避免失败槽位残留导致有效
-                    # N 减少、MC 失真，且树 done 后 resume 不再补跑）。
+                    # 树级重跑 1 次；仍失败不落库（resume 时槽位缺失再补）
                     res = await self._retry_rollout(
                         task_id=(self.iid, node.node_key, i, kind, priority),
                         payload=payload,
                     ) or res
-                existing[i] = res
-                # 失败 rollout **不落库**（视为没跑过）：resume 时该槽位为
-                # None → 重新提交重跑（修复 2026-08-31：失败结果落库会被
-                # resume 当作"已有"而永久固化，节点有效 N 减少）。
                 if res.error is None:
-                    self.store.upsert_rollout(res)
-        node.set_rollouts([r for r in existing if r is not None])
+                    present[i] = res
+                    self.store.upsert_rollout(res)     # 成功即落（事实）
+        if present:
+            node.set_rollouts([present[i] for i in sorted(present)])
+        else:
+            node.set_rollouts([])
         node.mc_score = node.compute_mc()
-        self._tree_dirty = True
+        self.store.set_node_ready(self.iid, node.node_key, mc_score=node.mc_score)
 
     async def _retry_rollout(self, task_id: tuple, payload: dict) -> Optional[RolloutResult]:
-        """失败 rollout 重跑一次（同一 payload）；仍失败返回 None（调用方保留
-        原失败结果，不落库、resume 时槽位为 None 再重跑）。"""
+        """失败 rollout 重跑一次（同一 payload）；仍失败返回 None。"""
         try:
             task = RolloutTask(
                 instance_id=task_id[0], node_key=task_id[1], rollout_idx=task_id[2],
@@ -689,84 +729,80 @@ class TreeDriver:
             logger.warning("%s: retry failed: %s", task_id[0], e)
             return None
 
-    def _load_cached(self, node_key: str) -> Optional[list[Optional[RolloutResult]]]:
-        """从 SQLite 加载该节点已有的 rollout 结果（断点续跑复用）。"""
-        slots = self.store.load_node_rollouts(self.iid, node_key, self.n_rollouts)
-        if slots is None or all(r is None for r in slots):
-            return None
-        return slots
-
     # ------------------------------------------------------------------
-    # 树搜索标注（ReARTeR process_annotations 移植）
+    # select（rollout 级选择；账本 = is_consumed）
     # ------------------------------------------------------------------
 
-    async def process_annotations(self, root: MCTSNode) -> None:
-        nodes = [root]
-        iteration = 0
+    def _select_candidate(self) -> tuple[Optional[MCTSNode], Optional[int]]:
+        """在池上选 (节点, 未消费 rollout) QU 全局最大；无候选返回 (None, None)。"""
+        best: Optional[MCTSNode] = None
+        best_idx: Optional[int] = None
+        best_qu: Optional[float] = None
+        for node in self.pool:
+            mc = node.mc_score
+            if mc is None or not (0.0 < mc < 1.0):
+                continue
+            u = compute_u_value(node, self.pool,
+                                exploration_param=self._q["exploration_param"])
+            consumed = self._consumed.get(node.node_key, set())
+            for idx in sorted(self._rollouts.get(node.node_key, {})):
+                if idx in consumed:
+                    continue
+                rollout = self._rollouts[node.node_key][idx]
+                if getattr(rollout, "error", None):
+                    continue
+                qu = (compute_q_value(rollout, mc, alpha=self._q["alpha"],
+                                      beta=self._q["beta"],
+                                      max_length=self._q["max_length"]) + u)
+                if best_qu is None or qu > best_qu:
+                    best_qu = qu
+                    best = node
+                    best_idx = idx
+        return best, best_idx
+
+    # ------------------------------------------------------------------
+    # 会话主循环（★判定只在会话成功结束时单事务提交）
+    # ------------------------------------------------------------------
+
+    async def process_annotations(self) -> None:
         while True:
-            node, idx, qu = select_best_node(nodes, **self.select_kwargs)
+            node, idx = self._select_candidate()
             if node is None:
                 break
-            if node.prefix_steps:
-                self.best_entries.append({
-                    "instance_id": self.iid,
-                    "node_key": node.node_key,
-                    "mc_score": node.mc_score,
-                    "n_steps": len(node.prefix_steps),
-                    "type": "best",
-                })
-                iteration += 1
-                if iteration > self.max_iterations:
-                    logger.info("%s: reached max iterations (%d)", self.iid, self.max_iterations)
-                    break
+            # 轮数上限（非 root 消费计数）：超限不再发起新会话
+            if node.prefix_steps and self.rounds >= self.rounds_cap:
+                logger.info("%s: reached rounds cap (%d)", self.iid, self.rounds_cap)
+                break
             node.increment_visits()
-            rollout = node.rollouts[idx]
-            expanded, new_leaves = await self.locate_error(node, rollout)
-            for n in expanded:
-                if n not in nodes:
-                    nodes.append(n)
-                    self.expanded.append(n)
-            self.leaves.extend(new_leaves)
-            # 每轮选择-定位后快照一次树结构（内存是权威，DB 是镜像）
-            self.store.save_nodes(self.iid, list(self.nodes.values()))
-            self._tree_dirty = False
+            rollout = self._rollouts[node.node_key][idx]
+            expanded, _leaves = await self._locate_session(node, rollout)
+            inc_round = bool(node.prefix_steps)
+            new_rounds = self.rounds + (1 if inc_round else 0)
+            # ★会话原子提交（唯一判定落库点）
+            self.store.commit_session(
+                self.iid, node.node_key, idx,
+                visits=node.visits,
+                increment_rounds=inc_round,
+                n_rounds=new_rounds,
+                expanded=[n.node_key for n in expanded],
+            )
+            self._consumed[node.node_key].add(idx)
+            if inc_round:
+                self.rounds = new_rounds
+            for n in expanded:                       # 本会话 expanded 入池
+                if n not in self.pool:
+                    self.pool.append(n)
 
-    async def locate_error(
+    async def _locate_session(
         self, node: MCTSNode, rollout: RolloutResult
     ) -> tuple[list[MCTSNode], list[MCTSNode]]:
-        """二分定位首个错误步（委托 :func:`mcts.locate.locate_error`）。"""
+        """二分定位会话（算法本体 mcts.locate.locate_error；probe 走事实层）。"""
         return await locate_error(
             node, rollout,
             get_node=self._get_or_create_node,
-            perform_rollouts=lambda n: self._perform_rollouts(n, kind="probe"),
+            perform_rollouts=lambda n: self._ensure_rollouts(n, kind="probe"),
         )
 
-    # ------------------------------------------------------------------
-    # 落盘（SQLite）
-    # ------------------------------------------------------------------
-
-    def _write_annotations(self) -> None:
-        entries = list(self.best_entries)
-        entries += [annotation_entry(leaf, "leaf") for leaf in self.leaves]
-        # add = 全部扩展节点（对齐 ReARTeR：全对探测节点 n3、leaf 节点不入 add）
-        entries += [annotation_entry(n, "add") for n in self.expanded]
-        self.store.write_annotations(self.iid, entries)
-
-    def _write_state(self) -> None:
-        if self._tree_dirty:
-            self.store.save_nodes(self.iid, list(self.nodes.values()))
-            self._tree_dirty = False
-        self.store.set_instance_status(
-            self.iid, self.status,
-            root_mc=(self.nodes.get("root").mc_score
-                     if self.nodes.get("root") else None),
-            messages_head=self._messages_head or None,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 管道（编排：worker + 树驱动 + 预算 + 统计）
-# ---------------------------------------------------------------------------
 
 
 class MCTSPipeline:
