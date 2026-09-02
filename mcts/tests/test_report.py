@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""``mcts.report`` 数据报告测试（纯逻辑，离线可跑）。"""
+"""``mcts.report`` 数据报告测试（v5，纯逻辑，离线可跑）。"""
 
+import asyncio
 import json
 
 from mcts.report import build_report, write_report
-from mcts.store import StateStore
 from mcts.tasks import Budget, EnvFactory, MCTSPipeline
 
 from mcts.tests.helpers import REARTE_R_SEQUENCES, ScriptedExecutor, make_instance
@@ -25,8 +25,6 @@ def _run_small_pipeline(workdir) -> dict:
         seed=1,
         stats_interval=999.0,
     )
-    import asyncio
-
     return asyncio.run(pipeline.run())
 
 
@@ -34,15 +32,17 @@ def test_report_structure_and_content(workdir):
     summary = _run_small_pipeline(workdir)
     report = build_report(workdir, summary=summary, config={"seed": 1, "trees": 1})
     assert report["db_counts"]["rollouts"] == 35
-    assert report["db_counts"]["annotations"] > 0
+    assert report["db_counts"]["nodes"] == 7
     assert report["statuses"] == {"done": 1}
     rs = report["rollout_stats"]
-    assert rs["total"] == 35 and rs["failed"] == 0
+    assert rs["total"] == 35
+    assert rs["consumed"] >= 1
     assert 0.0 < rs["avg_reward"] <= 1.0
-    as_ = report["annotation_stats"]
-    assert as_["best"] >= 4 and as_["leaf"] == 2 and as_["add"] == 3
-    assert report["per_instance"][0]["instance_id"] == "inst1"
-    assert report["per_instance"][0]["annotations"]["leaf"] == 2
+    ls = report["leaf_stats"]
+    assert ls["total"] == 2 and ls["instances_with_leaf"] == 1   # ReARTeR: n4+n6
+    inst = report["per_instance"][0]
+    assert inst["instance_id"] == "inst1"
+    assert inst["n_leaf"] == 2 and inst["n_rounds"] >= 1
     assert report["pipeline"]["throughput_rollouts_min"] is not None
 
 

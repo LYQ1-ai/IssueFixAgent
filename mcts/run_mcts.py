@@ -172,6 +172,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只从现有 state.db 生成数据报告（不跑 rollout）")
     p.add_argument("--no-report", action="store_true",
                    help="运行结束后不生成数据报告（默认生成 rollout_report.json/md）")
+    p.add_argument("--fresh", action="store_true",
+                   help="备份旧 state.db（state.db.bak.<ts>）后重建 v5 schema（旧库不自动迁移）")
 
     p.add_argument("--model", default=None, help="模型名（需 provider 前缀，如 openai/gemma-4）")
     p.add_argument("--base-url", default=None, help="OpenAI 兼容服务地址（本地 vLLM）")
@@ -235,6 +237,25 @@ def main(argv: Optional[list] = None) -> int:
         "model": args.model,
         "resume": args.resume,
     }
+
+    # --fresh / 旧库预检：v5 三表 schema 与旧 v2 库不兼容（施工文件 00 §6）
+    db_path = out_dir / "state.db"
+    if db_path.exists():
+        if args.fresh:
+            import shutil
+            bak = db_path.with_name(f"state.db.bak.{int(time.time())}")
+            shutil.copy2(db_path, bak)
+            db_path.unlink()
+            logger.info("fresh: 旧库已备份到 %s，将重建 v5 schema", bak)
+        else:
+            try:
+                from mcts.store import LegacySchemaError, StateStore
+                _probe = StateStore(db_path)
+                _probe.close()
+            except LegacySchemaError as e:
+                logger.error("%s", e)
+                print("[error] 旧版 state.db 与 v5 不兼容，请加 --fresh（自动备份后重建）。")
+                return 1
 
     # --report-only：只读现有 state.db 生成报告，不跑 rollout
     if args.report_only:
