@@ -1,0 +1,83 @@
+# ============================================================================
+# CodeAgentRL 阶段 1（PLAN.md）—— M0 数据预处理 超参配置
+#
+# 结构对应 PLAN §4 的 config.yaml：数据 / 过滤 / gold / 划分 / 环境准备 /
+# 输出路径；M1–M5 的 MCTS 超参（§2/§3）先以占位默认值列出，后续里程碑再细化。
+# ============================================================================
+
+data:
+  # 主数据源：codescout 的 SWE-Smith parquet（schema 已实测，见 PLAN §1.1）
+  parquet_paths:
+    - ref_papers/codescout/data/swe_smith/train.parquet
+    - ref_papers/codescout/data/swe_smith/validation.parquet
+
+filter:
+  # PLAN §1.2 过滤规则（开关 + 阈值）
+  drop_empty_statement: true        # 规则 1：空 / 空白 problem_statement
+  drop_created_deleted_files: true  # 规则 2：gold patch 新建或删除文件（agent 无法预测新建文件名 / 删除无 GT）
+  python_only_gold: true            # 规则 3：GT 只保留 Python 文件条目（README 等忽略）
+  drop_no_valid_gold: true          # 规则 3 派生：GT 过滤后无任何 Python 文件 -> 剔除
+  drop_duplicates: true             # 规则 4：重复 instance_id（保留首个）
+  drop_invalid_format: true         # 规则 4：非法格式行（repo 无 '/' / instance_id 含非法字符）
+  min_statement_len: 1              # 规则 5：problem_statement 长度下限（防过短无信息）
+  max_statement_len: 20000          # 规则 5：长度上限（超长超预算；实测 train 仅 3 行 >20000）
+
+gold:
+  # 三粒度 GT（对齐 codescout multilevel_localization_f1_reward 解析口径）
+  python_only: true
+  include_added_modules: true       # added_modules 与 edited_modules 一并计入（None 兜底）
+  include_added_entities: true      # added_entities 与 edited_entities 一并计入
+
+split:
+  # PLAN §1.3 三层划分
+  seed: 42                          # 固定随机种子（划分可复现）
+  gen_pool_ratio: 0.6               # 实例层：60% repo 的实例作为数据生成池
+  prm_train_ratio: 0.8              # repo 级防泄漏划分（同 repo 不跨 split，D6）
+  prm_dev_ratio: 0.1
+  prm_test_ratio: 0.1
+
+env:
+  # PLAN §2.2 环境准备（SWE-Smith 分支，对齐 codescout clone_instance）：
+  # repo 列本身即仓库地址；base_commit 恒为 None（单 commit 快照）-> commit 传 None
+  # -> 无 commit 时不切换（EnvManager 跳过 git checkout）；use_patch=True 恒成立
+  # -> patch（bug 引入 diff）在克隆后 git apply。
+  apply_patch: true
+
+outputs:
+  dir: outputs/mcts                  # instances/splits.parquet + rollouts / annotations / 报告落盘目录
+
+# ----------------------------------------------------------------------------
+# M1–M5 里程碑超参（PLAN §2.3–2.4 / docs/mcts_engine_design.md）
+# ----------------------------------------------------------------------------
+mcts:
+  n_rollouts: 5                     # 每节点 rollout 次数 N（ReARTeR / OmegaPRM 同值）
+  # 奖励设计（docs/reward_design.md 综合方案，2026-08-28 起）：
+  reward:
+    mode: layered                   # layered（主路径：层级路径匹配 + Soft-F1）/ independent（旧三层 F1 相加对照）
+    threshold: 0.6                  # correct 阈值 τ（落在 class 档 0.5 与 func 档 1.0 之间 ⇒ "正确 = 至少函数级精确定位"）
+    depth_weights: {1: 0.2, 2: 0.5, 3: 1.0}   # 各匹配深度得分（file / class / func）
+    strict_multi_gate: true         # N≥2 时额外要求 func 级命中 ≥ ⌈N/2⌉（防 file 级堆 recall）
+    missing_level_norm: true        # gold 层级缺失时按最细可得层级 Lᵢ 折算 credit（缺失实例可达满分）
+    overpromise_penalty: 0.0        # 断言了 class/func 但未命中的预测每层扣分（默认关，δ 从 0 起步）
+    duplicate_penalty: 0.0          # 与已匹配预测共享 file/(file,class) 前缀的未匹配预测扣分（默认关）
+  reward_weights: [1.0, 1.0, 1.0]   # independent 模式的 file / module / entity 三层 F1 权重（对照用）
+  select_alpha: 0.5                 # QU 选择：α^(1-MC)
+  select_beta: 0.9                  # QU 选择：β^(len/max_len)
+  select_max_length: 6              # QU 选择：len 归一化基准（ReARTeR 默认 6）
+  select_c: 0.125                   # QU 选择：c·√(Σvisits)/(1+visits)
+  max_concurrency: 8                # 全局并发 rollout worker 数（目标 40–50，随 vLLM 吞吐实测调优）
+  creation_concurrency: 8           # 容器并发创建数上限（只限同时创建数，不限总次数；防创建风暴）
+  step_limit: 20                    # agent 回合上限（2026-08-27 起 8→20：给定位+提交留余量）
+  cost_limit: 3.0                   # 单次 agent 执行成本上限（mini-swe-agent cost_limit）
+  temperature_range: [0.7, 1.0]     # rollout 采样温度范围（ReARTeR 多样性来源）
+  max_iterations: 20                # 标注循环轮数上限（对齐 ReARTeR）
+  config_file: config/mini_submit.yaml  # 纯定位提示词 + submit_locations 提交（PLAN §2.2）
+  # 提交协议（PLAN §2.2 改造，仿 CodeScout localization_finish）：
+  submit:
+    enabled: true
+    magic_submit: false             # 默认禁用 bash 魔法串提交（True 恢复旧行为）
+    model_class: agent.submit_model.SubmitLocationsModel   # tools=[bash, submit_locations]
+    agent_class: agent.submit_agent.SubmitAgent            # submit 触发 Submitted + 轮次耗尽催收
+  max_budget_tokens: 0              # 0 = 不限制（token 预算熔断预留）
+  worker_retries: 2                 # rollout 失败重试次数（docker/LLM 抖动兜底）
+  stats_interval: 30                # 进度日志周期（秒）

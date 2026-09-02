@@ -1,0 +1,28 @@
+# env / secrets
+.env
+*.env.local
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+# outputs / data / generated
+outputs/
+data/
+*.parquet
+*.db
+*.db-wal
+*.db-shm
+*.zip
+*.log
+*.bak.*
+# third-party references (vendored, each with own .git)
+ref_papers/
+# local scratch
+stage/
+.pytest-tmp/
+.pytest-wd/
+pytest-cache-files-*/
+.impl_base/
+# root-owned unreadable (no sudo on A800)
+scripts/extract_pdf_text.mjs
