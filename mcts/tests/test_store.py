@@ -1,144 +1,246 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""``mcts.store`` SQLite 持久化测试（纯逻辑，离线可跑）。
+"""StateStore v5 单元测试（施工文件 05 §2）。
 
-覆盖：schema 初始化、rollout upsert/load 往返（不含轨迹）、节点快照、
-标注与实例状态、并发写入（worker 线程模拟）。
+覆盖：schema/旧库检测、tree/nodes/rollouts CRUD、commit_session 原子性、
+upsert 不覆盖消费账本、load_tree_state、聚合、并发写。
 """
 
-import json
+import sqlite3
 import threading
 
-from mcts.store import StateStore
-from mcts.tasks import RolloutResult
+import pytest
 
-from mcts.tests.helpers import make_instance, make_step
-
-
-def _result(iid="inst1", node_key="root", idx=0, correct=True, n_steps=2) -> RolloutResult:
-    return RolloutResult(
-        instance_id=iid, node_key=node_key, rollout_idx=idx,
-        reward=1.0 if correct else 0.0, correct=correct,
-        steps=[make_step(f"step {j}") for j in range(n_steps)],
-        trajectory={"info": {}, "messages": [{"role": "exit"}]},  # 落库时应被剔除
-        exit_status="Submitted" if correct else "LimitsExceeded",
-        submission="diff --git a/x.py b/x.py" if correct else "",
-        n_calls=n_steps, cost=0.0, duration=0.1, replay_drift=False,
-        trace_id="trace-1",
-    )
+from mcts.store import LegacySchemaError, StateStore
 
 
-class TestRolloutRoundtrip:
-    def test_upsert_and_load(self, workdir):
-        store = StateStore(workdir / "state.db")
-        try:
-            store.upsert_rollout(_result())
-            slots = store.load_node_rollouts("inst1", "root", 5)
-            assert slots[0] is not None
-            assert slots[1] is None                       # 未写的槽位为 None
-            r = slots[0]
-            assert r.correct is True and r.reward == 1.0
-            assert len(r.steps) == 2
-            assert r.trace_id == "trace-1"
-        finally:
-            store.close()
-
-    def test_trajectory_not_persisted(self, workdir):
-        store = StateStore(workdir / "state.db")
-        try:
-            store.upsert_rollout(_result())
-            with store._write_lock:
-                row = store._conn.execute(
-                    "SELECT result_json FROM rollouts").fetchone()
-            payload = json.loads(row[0])
-            assert "trajectory" not in payload             # DB 体积控制
-            assert "steps" in payload
-        finally:
-            store.close()
-
-    def test_upsert_idempotent(self, workdir):
-        store = StateStore(workdir / "state.db")
-        try:
-            store.upsert_rollout(_result(correct=True))
-            store.upsert_rollout(_result(correct=False))   # 同 key 覆盖
-            assert store.count_rollouts("inst1") == 1
-            slots = store.load_node_rollouts("inst1", "root", 5)
-            assert slots[0].correct is False
-        finally:
-            store.close()
+def make_store(tmp_path) -> StateStore:
+    return StateStore(tmp_path / "state.db")
 
 
-class TestNodeSnapshot:
-    def test_save_nodes_roundtrip(self, workdir):
-        from mcts.node import MCTSNode
+class _FakeResult:
+    """最小 RolloutResult 兼容对象（真实流程由 RolloutResult 提供）。"""
 
-        store = StateStore(workdir / "state.db")
-        try:
-            node = MCTSNode(instance_id="inst1", node_key="n_key",
-                            prefix_steps=[make_step("p1"), make_step("p2")])
-            node.mc_score = 0.6
-            node.visits = 3
-            node.add_rollout(_result(correct=True))
-            node.add_rollout(_result(correct=False))
-            store.save_nodes("inst1", [node])
-            with store._write_lock:
-                row = store._conn.execute(
-                    "SELECT prefix_json, mc_score, visits, n_rollouts, rollouts_json"
-                    " FROM nodes WHERE instance_id='inst1' AND node_key='n_key'").fetchone()
-            prefix = json.loads(row[0])
-            assert len(prefix) == 2
-            assert row[1] == 0.6 and row[2] == 3 and row[3] == 2
-            # JSON 键为字符串
-            assert json.loads(row[4]) == {"0": True, "1": True}
-        finally:
-            store.close()
+    def __init__(self, iid="i", node_key="root", idx=0, correct=True,
+                 reward=1.0, exit_status="Submitted", steps=None,
+                 replay_drift=False):
+        self.instance_id = iid
+        self.node_key = node_key
+        self.rollout_idx = idx
+        self.correct = correct
+        self.reward = reward
+        self.exit_status = exit_status
+        self.steps = steps if steps is not None else []
+        self.replay_drift = replay_drift
+        self.error = None
 
-
-class TestAnnotationsAndStatus:
-    def test_annotations_write_and_status(self, workdir):
-        store = StateStore(workdir / "state.db")
-        try:
-            store.write_annotations("inst1", [
-                {"instance_id": "inst1", "node_key": "a", "type": "best",
-                 "mc_score": 0.8, "n_steps": 2},
-                {"instance_id": "inst1", "node_key": "b", "type": "leaf",
-                 "mc_score": 0.0, "n_steps": 3},
-            ])
-            store.set_instance_status("inst1", "done", root_mc=0.4,
-                                      messages_head=[{"role": "system", "content": "s"}])
-            status = store.get_instance_status("inst1")
-            assert status["status"] == "done"
-            assert status["root_mc"] == 0.4
-            assert status["messages_head"] == [{"role": "system", "content": "s"}]
-            assert store.counts()["annotations"] == 2
-        finally:
-            store.close()
+    def to_dict(self, include_trajectory=True):
+        return {
+            "instance_id": self.instance_id, "node_key": self.node_key,
+            "rollout_idx": self.rollout_idx, "correct": self.correct,
+            "reward": self.reward, "steps": self.steps,
+            "exit_status": self.exit_status, "error": self.error,
+        }
 
 
-class TestConcurrentWrites:
-    def test_thread_safe_upserts(self, workdir):
-        store = StateStore(workdir / "state.db")
-        try:
-            n_threads, per_thread = 8, 10
-            barrier = threading.Barrier(n_threads)
-            errors: list = []
+def _setup(s: StateStore, iid="i"):
+    s.create_tree(iid, [{"role": "user", "content": "task"}])
+    s.ensure_node(iid, "root", [])
+    s.ensure_node(iid, "n1", [{"assistant": {"content": "a"}}])
 
-            def worker(tid):
-                try:
-                    barrier.wait()
-                    for i in range(per_thread):
-                        store.upsert_rollout(_result(
-                            iid=f"inst{tid}", node_key="root", idx=i))
-                except Exception as e:  # noqa: BLE001
-                    errors.append(e)
 
-            threads = [threading.Thread(target=worker, args=(t,))
-                       for t in range(n_threads)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-            assert errors == []
-            assert store.count_rollouts() == n_threads * per_thread
-        finally:
-            store.close()
+class TestSchema:
+    def test_fresh_schema(self, tmp_path):
+        s = make_store(tmp_path)
+        tables = {r[0] for r in s._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"tree_instances", "nodes", "rollouts"} <= tables
+        assert "annotations" not in tables and "instances" not in tables
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(rollouts)")}
+        assert {"is_consumed", "consumed_iteration", "result_json"} <= cols
+        s.close()
+
+    def test_legacy_detection(self, tmp_path):
+        """旧 v2 库（annotations/instances 表）打开即抛 LegacySchemaError。"""
+        p = tmp_path / "legacy.db"
+        c = sqlite3.connect(str(p))
+        c.executescript(
+            "CREATE TABLE instances (instance_id TEXT PRIMARY KEY, status TEXT);"
+            "CREATE TABLE rollouts (instance_id TEXT, node_key TEXT,"
+            " rollout_idx INTEGER, result_json TEXT, error TEXT,"
+            " PRIMARY KEY (instance_id,node_key,rollout_idx));"
+            "CREATE TABLE annotations (id INTEGER PRIMARY KEY);")
+        c.commit()
+        c.close()
+        with pytest.raises(LegacySchemaError):
+            StateStore(p)
+
+
+class TestTree:
+    def test_create_get_idempotent(self, tmp_path):
+        s = make_store(tmp_path)
+        assert s.create_tree("i1", [{"role": "user", "content": "q"}]) is True
+        assert s.create_tree("i1", []) is False
+        t = s.get_tree("i1")
+        assert t["status"] == "not_started" and t["n_rounds"] == 0
+        assert t["messages_head"][0]["content"] == "q"
+        assert s.get_tree("missing") is None
+        s.close()
+
+    def test_status_and_rounds(self, tmp_path):
+        s = make_store(tmp_path)
+        s.create_tree("i1", [])
+        s.set_tree_status("i1", "running", root_mc=0.4)
+        s.increment_rounds("i1")
+        t = s.get_tree("i1")
+        assert t["status"] == "running" and t["root_mc"] == 0.4
+        assert t["n_rounds"] == 1
+        s.close()
+
+
+class TestNodes:
+    def test_ensure_node(self, tmp_path):
+        s = make_store(tmp_path)
+        s.create_tree("i1", [])
+        assert s.ensure_node("i1", "root", []) is True
+        assert s.ensure_node("i1", "root", []) is False  # 幂等
+        assert s.ensure_node("i1", "n1", [{"assistant": {"content": "a"}}]) is True
+        row = s.get_node_row("i1", "root")
+        assert row["status"] == "rollout" and row["in_pool"] == 1
+        assert s.get_node_row("i1", "n1")["in_pool"] == 0
+        s.close()
+
+    def test_set_node_ready(self, tmp_path):
+        s = make_store(tmp_path)
+        s.create_tree("i1", [])
+        s.ensure_node("i1", "n1", [{"assistant": {"content": "a"}}])
+        s.set_node_ready("i1", "n1", mc_score=0.6)
+        row = s.get_node_row("i1", "n1")
+        assert row["status"] == "ready" and row["mc_score"] == 0.6
+        s.close()
+
+
+class TestRollouts:
+    def test_upsert_load(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        s.upsert_rollout(_FakeResult(idx=2, correct=False, reward=0.0,
+                                     exit_status="LimitsExceeded"))
+        assert s.count_node_rollouts("i", "root") == 2
+        slots = s.load_node_rollouts("i", "root", 3)
+        assert slots[0] is not None and slots[1] is None and slots[2] is not None
+        assert slots[2].correct is False
+        s.close()
+
+    def test_upsert_never_overwrites_consumed(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        s.commit_session("i", "root", 0, visits=1, increment_rounds=False)
+        # 同槽位结果重写（防御性）→ is_consumed 保留
+        s.upsert_rollout(_FakeResult(idx=0, reward=2.0))
+        assert s.is_rollout_consumed("i", "root", 0) is True
+        row = s.load_node_rollout_rows("i", "root")[0]
+        assert row["is_consumed"] == 1
+        s.close()
+
+
+class TestCommitSession:
+    def test_success(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        s.commit_session("i", "root", 0, visits=3, increment_rounds=False,
+                         expanded=["n1"])
+        assert s.is_rollout_consumed("i", "root", 0) is True
+        assert s.get_node_row("i", "root")["visits"] == 3
+        assert s.get_node_row("i", "n1")["in_pool"] == 1
+        assert s.get_tree("i")["n_rounds"] == 0
+        s.close()
+
+    def test_increment_rounds_and_iteration(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.ensure_node("i", "n2", [{"assistant": {"content": "b"}}])
+        s.upsert_rollout(_FakeResult(idx=0, node_key="n1"))
+        s.commit_session("i", "n1", 0, visits=1, increment_rounds=True,
+                         n_rounds=4, expanded=["n2"])
+        assert s.get_tree("i")["n_rounds"] == 4
+        row = s.load_node_rollout_rows("i", "n1")[0]
+        assert row["consumed_iteration"] == 4
+        s.close()
+
+    def test_atomic_rollback(self, tmp_path):
+        """事务中途失败 → is_consumed/visits/n_rounds/in_pool 全部回滚。"""
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        with pytest.raises(sqlite3.ProgrammingError):
+            s.commit_session("i", "root", 0, visits=5, increment_rounds=True,
+                             n_rounds=7, expanded=[("bad", "tuple")])
+        assert s.is_rollout_consumed("i", "root", 0) is False
+        assert s.get_node_row("i", "root")["visits"] == 0
+        assert s.get_tree("i")["n_rounds"] == 0
+        assert s.get_node_row("i", "n1")["in_pool"] == 0
+        s.close()
+
+
+class TestLoadTreeState:
+    def test_roundtrip(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        s.commit_session("i", "root", 0, visits=1, increment_rounds=False,
+                         expanded=["n1"])
+        st = s.load_tree_state("i")
+        assert st["tree"]["status"] == "not_started"
+        assert set(st["nodes"]) == {"root", "n1"}
+        assert st["nodes"]["root"]["in_pool"] == 1
+        assert st["rollouts"]["root"][0]["is_consumed"] is True
+        assert st["rollouts"]["root"][0]["result"].reward == 1.0
+        s.close()
+
+
+class TestAggregates:
+    def test_summaries(self, tmp_path):
+        s = make_store(tmp_path)
+        _setup(s)
+        s.upsert_rollout(_FakeResult(idx=0))
+        s.upsert_rollout(_FakeResult(idx=1, correct=False, reward=0.0))
+        s.commit_session("i", "root", 0, visits=1, increment_rounds=False)
+        s.set_node_ready("i", "n1", mc_score=0.0)
+        sums = s.tree_summaries()
+        assert sums[0]["n_rollouts"] == 2
+        assert sums[0]["n_correct"] == 1
+        assert sums[0]["n_consumed"] == 1
+        leaves = s.leaf_summaries()
+        assert leaves[0]["count"] == 1  # n1 mc==0 且非 root
+        assert s.counts()["rollouts"] == 2
+        s.close()
+
+
+class TestConcurrency:
+    def test_parallel_writes(self, tmp_path):
+        s = make_store(tmp_path)
+        s.create_tree("i", [])
+        s.ensure_node("i", "root", [])
+        errors = []
+
+        def writer():
+            try:
+                for j in range(20):
+                    s.upsert_rollout(_FakeResult(
+                        idx=j, correct=(j % 2 == 0),
+                        reward=1.0 if j % 2 == 0 else 0.0))
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert s.count_node_rollouts("i", "root") == 20
+        s.close()
