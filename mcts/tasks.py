@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-License-Identifier: BSD-3-Clause
 
 """任务驱动高并发 MCTS 引擎（PLAN §2.3–2.4 / 设计文档 docs/mcts_engine_design.md）。
 
@@ -39,6 +39,11 @@ from mcts.node import MCTSNode, compute_q_value, compute_u_value
 from mcts.steps import Step, messages_for_prefix, prefix_node_key, steps_to_messages
 
 logger = logging.getLogger("mcts.tasks")
+
+try:
+    from tqdm import tqdm  # MCTS 树 batch 进度条；未安装时静默降级（无进度条）
+except ImportError:  # pragma: no cover
+    tqdm = None
 
 
 def messages_head_from_rollouts(rollouts: list) -> list[dict]:
@@ -869,6 +874,12 @@ class MCTSPipeline:
 
         results: list[dict] = []
         db_counts: dict = {}
+        # MCTS 树 batch 进度条：每完成一棵树 +1（并发完成，FIRST_COMPLETED 逐棵结算）
+        n_trees = len(self.instances)
+        pbar = None
+        if tqdm is not None and n_trees > 1:
+            pbar = tqdm(total=n_trees, desc="MCTS trees", unit="tree",
+                        leave=True, mininterval=1.0)
         try:
             drivers = [
                 asyncio.create_task(TreeDriver(
@@ -882,8 +893,20 @@ class MCTSPipeline:
                 ).run())
                 for inst in self.instances
             ]
-            results = await asyncio.gather(*drivers)
+            pending: set = set(drivers)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:  # noqa: BLE001 - driver 内部已兜底
+                        logger.error("tree driver crashed: %s", e)
+                    if pbar is not None:
+                        pbar.update(1)
         finally:
+            if pbar is not None:
+                pbar.close()
             logger_task.cancel()
             for w in workers:
                 w.shutdown.set()

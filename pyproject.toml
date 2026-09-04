@@ -1,0 +1,47 @@
+# CodeAgentRL —— 项目打包/模块运行配置（pyproject.toml）
+#
+# 作用：
+#   1) `pip install -e .` 后可在任意目录以 `python -m mcts.run_mcts ...` /
+#      `python -m mcts.instances build ...` 等模块方式运行（源码树内本来就可，
+#      安装后不依赖当前工作目录）；
+#   2) 为 setuptools/pytest/ruff 等工具提供统一元数据。
+#
+# 依赖说明（重要）：
+#   - openai / litellm / arize-phoenix 等版本互相咬死，见 README §7「依赖版本约束」，
+#     由 conda 环境手工锁定（openai==2.54.0 / litellm==1.97.0），**不在本项目声明**，
+#     避免 `pip install .` 触发解析冲突破坏既有环境；
+#   - 这里只列通用纯运行依赖（均已安装在 CodeAgentRL 环境）。
+#
+# 安装（可选，A800 上执行一次即可）：
+#   conda activate CodeAgentRL
+#   pip install -e . --no-deps     # 不触碰依赖，仅注册包便于 python -m
+#
+# 卸载：pip uninstall codeagentrl
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeagentrl"
+version = "0.1.0"
+description = "CodeAgentRL：面向 GitHub Issue 修复 Agent 的 RL（MCTS 过程监督数据 → PRM → KTO/DPO）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "BSD-3-Clause" }
+dependencies = [
+    "tqdm>=4.60",          # MCTS 树 batch 进度条（tasks.py 惰性导入，缺失自动降级）
+    "pyyaml",              # mcts/config.yaml 加载
+    "python-dotenv",       # .env 加载（README §4：import agent 前 load_dotenv）
+    "pandas",              # M0 数据层（instances/splits parquet 读写）
+    "pyarrow",             # parquet 后端
+    "jinja2",              # 提示词模板渲染（build_messages_head）
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "mcts*"]
+exclude = ["mcts.tests*", "*.tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["test", "mcts/tests"]
