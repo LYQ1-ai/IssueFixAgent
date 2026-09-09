@@ -26,3 +26,8 @@ pytest-cache-files-*/
 .impl_base/
 # root-owned unreadable (no sudo on A800)
 scripts/extract_pdf_text.mjs
+
+# IDE
+.idea/
+.vscode/
+*.iml
