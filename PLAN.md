@@ -9,7 +9,7 @@
 
 ---
 
-## 📍 当前进度（更新于 2026-08-27）
+## 📍 当前进度（更新于 2026-09-08）
 
 | 状态 | 事项 |
 | --- | --- |
@@ -28,8 +28,9 @@
 | ✅ 已完成 | **10 样本真实 rollout demo**（2026-08-27，qwen3.5-4B @ sglang）：`scripts/run_rollout.sh --trees 10 --seed 42 --concurrency 40` —— 10 树 × N=5 = **50 次真实 rollout / 0 失败 / 77s**，reward 中位 2.25/3.0，全链路（读数据→抽样→真实 Rollout→SQLite→报告）端到端通畅；**发现**：①50/50 全部 correct（θ=0.5 过宽 + qwen 定位强）→ root_mc 全 1.0 → **门控未触发 → 标注 0 条**（无 best/leaf/add，需调 `--reward-threshold` 产出 PRM 分步标注）；②qwen3.5-4B 从不提交（exit_status 全 LimitsExceeded，7–8 步撞 step_limit=8，submission 空）→ 需提高 `--step-limit` 观察提交行为 |
 | ✅ 已完成 | **提交协议改造：submit_locations 结果提交工具**（2026-08-27，仿 CodeScout `localization_finish`）：① 新工具 `submit_locations`（schema/校验/规则提示词在 `agent/submit_tool.py`，OpenAI function-calling，`{file(必填), class_name, function_name}`，对齐 CodeScout TOOL_DESCRIPTION 规则 1–4 + IMPORTANT）；② 接入 mini-swe-agent **不改其源码**——`agent/submit_model.py::SubmitLocationsModel`（继承 LitellmModel，`tools=[bash, submit_locations]`，经 `get_model(model_class=...)` 注入，根 rollout 与 probe 回放同路径）+ `agent/submit_agent.py::SubmitAgent`（继承 DefaultAgent：`execute_actions` 拦截 submit 动作 → 抛 `Submitted`，**任务结束标志同步修改**：exit_status="Submitted"、submission=结构化 locations JSON，`mcts/steps.py::extract_exit` 无需改动）；③ **默认轮次上限 8→20**（config.yaml / executor / CLI / run_rollout.sh）；④ **催收机制**：到达轮次上限或提前结束（LimitsExceeded/TimeExceeded/RepeatedFormatError）但未提交 → 移除 exit、注入 user 催收消息要求用 submit_locations 输出结果、放行最后一轮（`_agent_loop` 统一循环，probe 续跑复用），催收只发一次；⑤ **完全结构化判定**：reward 只认有效提交（`mcts/reward.py::reward_from_trajectory_exit`，无提交/无效提交 → 0，对齐 CodeScout），旧 git-diff 判定保留为兼容函数；⑥ bash 魔法串提交**默认禁用**（`AttachContainerEnvironment.magic_submit` 开关，config `mcts.submit.magic_submit`，CLI `--magic-submit/--no-magic-submit`）；⑦ 新提示词 `config/mini_submit.yaml`（纯定位模式，对齐 CodeScout system_prompt_custom_finish）；⑧ 报告加提交率（store rollouts.submitted 聚合列 + report rollout_stats.submitted/submit_rate）；⑨ 单测 +38（submit 工具解析/SubmitAgent 催收/结构化 reward），**A800 全量 235 passed / 17 skipped**，dry-run 与旧库 report-only 迁移验证通过 |
 | ✅ 已完成 | **提交协议改造实机验证（gemma-4 @ vLLM，2026-08-27）**：`scripts/run_rollout.sh --trees 10 --seed 42 --concurrency 40 --reward-threshold 2.0 --model openai/gemma-4 --base-url http://localhost:8010/v1 --output outputs/mcts_gemma` —— **565 rollouts / 0 失败 / 1068s（吞吐 ~31/min，受共享机负载拖累）**；**提交率 1.0（565/565 exit_status="Submitted"，submit_locations 结构化提交全部生效）**；完全结构化判定 reward 分布 {1.0×248, 3.0×290, 部分 1.5–2.67}，θ=2.0 下 4/10 树 MC∈(0,1) **门控触发 → 标注 159 条（best 84 / leaf 20 / add 55，覆盖 4 实例）**；**催收实机生效**：15 条 rollout 撞 20 轮上限（n_calls=21 = 20+1 grace）收到 user 催收消息后全部在最后一轮提交成功；对比旧 demo（qwen θ=0.5：0/50 提交、0 标注）全链路目标达成 |
-| ⏳ 待验证 | **M2/M3 实机批量（产出标注）**：qwen3.5-4B @ sglang 同参数重跑（`--reward-threshold 2.0`），验证 sglang qwen3_coder parser 对双工具（bash + submit_locations）的支持与提交率 → 500–2000 实例批量，记录吞吐/失败率（验收：失败 <5%、标注非零、提交率 >0、`--resume` 可续、容器无泄漏） |
-| ⏳ 未开始 | **M4–M5**：PRM 训练（PEFT LoRA）→ 交付报告；**SQLite 崩溃恢复**（重建树状态机继续 select/locate） |
+| ✅ 已完成 | **v5 存储/驱动重构（2026-09-03）**：SQLite 三表（tree_instances/nodes/rollouts，删 annotations 表与整树快照）+ **会话原子提交**（一次 (select+locate) 判定单事务：is_consumed/visits/n_rounds/in_pool；失败不落库）+ TreeDriver 会话式执行流（无 DB 从零注册、DB 整树恢复、中断会话重做）+ report/CLI 适配（`--fresh` 旧库备份重建）；施工文件 `docs/construction/00-05`；单测全量 266 passed；A800 真机旧库迁移 + **kill -9 断点恢复验收**（done 树跳过零重写、running 树续跑、容器无泄漏） |
+| ✅ 已完成 | **M2/M3 实机批量 2000 树（2026-09-08，qwen3.5-4B @ sglang）**：`scripts/run_rollout.sh --trees 2000 --seed 42 --reward-threshold 0.6 --concurrency 40 --resume`（输出 `outputs/batch500`，全程 ~4.35 天）—— **2000/2000 树 done（0 failed / 0 budget_exhausted）**；rollouts **116,444**（失败 104 / 0.09%）、nodes 23,294、**consumed 会话 20,465**、**leaf 派生 2,412（433 实例）**、root 门控 964 树；提交率 0.767、correct 0.594、avg_reward 0.59；LLM 调用 ~48 万、容器创建 86,065 无泄漏、DB ~5GB；验收达标（失败 <5%、标注非零、`--resume` 可续、容器无泄漏） |
+| ⏳ 未开始 | **M4–M5**：PRM 训练（PEFT LoRA，输入 = outputs/batch500 的 v5 state.db 派生步级样本，见 §3.1）→ 交付报告（SQLite 崩溃恢复已在 v5 完成） |
 
 > 后续每个里程碑完成后在此表中更新状态并记录日期。
 
@@ -230,12 +231,10 @@ M0 除 `mcts/` 包外，另提供一键执行与运维脚本（均已在 A800 �
   - **容器不复用**（v2）：`EnvManager` 每次 `get_env` 新建容器（uuid 命名互不冲突）、
     `release_env` 幂等删除；executor 在 `finally` 中销毁（成功/失败都删），
     **任务完成归还自动销毁**，无池化、无状态复位；
-- **持久化（v2，SQLite）**：
-  - `outputs/mcts/state.db`（WAL）：`rollouts`（完成即 upsert，不含大块轨迹）、`nodes`
-    （树结构定期快照）、`annotations`（best/leaf/add）、`instances`（状态 + root_mc +
-    messages_head）；**树结构与 rollout 结果常驻内存**，DB 是崩溃安全镜像；
-  - **断点续跑**：实例级 `status ∈ {done, failed}` 跳过；节点级按 `node_key` 从
-    rollouts 表复用已有结果（缺失 idx 才重新提交）；**崩溃恢复（重建状态机）后置实现**；
+- **持久化（v5，SQLite 三表，2026-09-03 起）**：
+  - `outputs/mcts/state.db`（WAL）三表：`tree_instances`（status：not_started/running/budget_exhausted/done/failed + n_rounds + head）、`nodes`（prefix_json/mc/visits/in_pool；创建即落、结算置 ready）、`rollouts`（成功即落、`is_consumed` 消费账本、失败不落库）；**删 annotations 表与整树快照**（leaf 由 非root∧mc==0 派生）；
+  - **会话原子提交**：一次 (select+locate) 的判定（is_consumed/visits/n_rounds/expanded.in_pool）在会话成功结束时**单事务**落库 —— 崩溃中途 = 判定未提交 = 该 (node, rollout) 未消费 → resume 重选重做（probe 结果内容寻址复用，仅补在飞缺槽），**无需保存二分中间状态**；
+  - **断点续跑（v5）**：run() 从 DB 整树载入重建；树 `status ∈ {done, failed}` 跳过，running/budget_exhausted/not_started 续跑；缺槽（含失败/预算部分）一律按 rollouts 行数 lazy 补跑；`kill -9` 恢复经 A800 真机验收；
 - **可靠性**：
   - **重试与降级**：单次 rollout 失败重试（退避）；仍失败记为 failed（不计入 N，对齐 ReARTeR
     bad_gen 语义）；单实例全部失败标记 `failed` 保留已有数据；
@@ -270,13 +269,10 @@ select_best_node / locate_error / best-leaf-add 标注）与 OmegaPRM 论文；�
   - `MC==1` → 前缀已稳，停止（错误在右半之外，无需再探）；
   - `0<MC<1` → 错误在右半，把左半并入正确前缀继续二分；
   - `MC==0` → 错误在左半，收缩左半；步数 < 2 时终止，记录 **leaf**（首个错误位置候选）。
-- **标注产出**（对齐 ReARTeR `process_annotations`，写 `outputs/mcts/annotations/*.json`）：
-  - `best`：每次被选中的带前缀节点及其 MC（正确前缀的佐证，连续型标签来源）；
-  - `leaf`：二分定位到的错误叶子（首个错误步的负样本）；⚠️ 修正 ReARTeR 缺陷：记录**叶子自己的**前缀
-    （ReARTeR 正常路径误用最后一次选中节点的前缀，见 docs/01 §11.8）；
-  - `add`：全部**扩展**节点（0<MC<1 的中间节点；全对探测节点与 leaf 不入 add）；
-  - 轮数上限 20（对齐 ReARTeR）；根节点不落盘；每条标注带 `node_key`（下游按
-    `(instance_id, node_key)` 与 rollout 文件 join 出完整前缀消息）。
+- **标注产出（v5 派生口径，2026-09-03 起；评审 D8）**：不再落盘 best/leaf/add（删表）——
+  - 节点角色由 MC 派生：`leaf`（首个错误步负样本）= **非 root ∧ mc==0**；`0<mc<1` = 扩展节点（in_pool，PRM 连续标签来源）；`mc==1` 全对探针仅留作内容寻址复用；root 无前缀不产标注；
+  - select 消费账本 = `rollouts.is_consumed`（会话结束提交，root 消费同样记录）；
+  - 下游 PRM 展开（§3.1）按 `(instance_id, node_key)` join `nodes.prefix_json` + head 还原消息；
 - **终态回报实现（奖励模块 `mcts/reward.py`）**：
   - **结构化判定（主路径，2026-08-27 起）**：`reward_from_trajectory_exit` —— 仅
     `exit_status == "Submitted"` 且 submission 为合法 locations JSON 才计 reward；
@@ -348,15 +344,16 @@ CodeAgentRL/
 │   ├── reward.py              ✅ 终态回报：diff 解析 + patch-vs-gold 定位 F1（主）/ test-based（备）
 │   ├── steps.py               ✅ 轨迹 → 步序列解析 / 出口识别 / 前缀消息裁剪 / node_key（D1）
 │   ├── node.py                ✅ MCTSNode / MC / QU 选择（纯函数，ReARTeR 移植）
-│   ├── locate.py              ✅ locate_error 二分 + best/leaf/add 标注条目（异步任务驱动）
+│   ├── locate.py              ✅ locate_error 二分 + expanded/leaf 返回（会话驱动，无标注落盘）
 │   ├── replay.py              ✅ 前缀回放 + 自由续跑（D3，含回放一致性校验）
 │   ├── tasks.py               ✅ 任务驱动高并发引擎：TaskQueue / EnvFactory / Worker /
 │   │                              TreeDriver / MCTSPipeline / 预算 / SQLite 续跑（D4，见设计文档）
-│   ├── store.py               ✅ SQLite 持久化：rollouts/nodes/annotations/instances（WAL + 单写锁）
+│   ├── store.py               ✅ v5 SQLite 三表：tree_instances/nodes/rollouts（WAL+单写锁；
+│   │                              commit_session 会话原子提交 / load_tree_state / 旧库检测）
 │   ├── executor.py            ✅ 生产 rollout 执行器：create_env → 回放/自由跑 → 回报 → destroy_env
 │   ├── run_mcts.py            ✅ 入口 CLI（--sample/--instances/--resume/--concurrency/
 │   │                              --create-concurrency/--max-rollouts/--dry-run/--phoenix-tracing）
-│   └── tests/                 ✅ 树逻辑合成测试（ReARTeR 数值示例端到端）+ 并发语义 + 续跑 + store（62 个）
+│   └── tests/                 ✅ 树逻辑合成测试（ReARTeR 数值示例端到端）+ 会话/恢复/孤儿用例；全量 266 passed
 ├── prm/                       # PRM 训练（新建包）
 │   ├── build_dataset.py       # 标注 → 步级样本（§3.1）
 │   ├── train_prm.py           # PEFT LoRA + 分类头 CE（§3.2）
@@ -385,8 +382,8 @@ CodeAgentRL/
 | --- | --- | --- |
 | **M0 数据层** ✅（2026-08-25，脚本化 08-26） | §1 全部脚本 + 数据报告 + 流水线脚本（`preprocess_data.sh` / `batch_repo_pull.py`） | 过滤数量级对齐 CodeScout（39,284 / 131 repos）；split 无 repo 泄漏（0）；gold 抽取得出三层 F1 可复算（38,680/39,284 实例含 entities，单测覆盖 added_* 并入）；一键重跑可复现 |
 | **M1 单 rollout** ✅（2026-08-27 实机验证） | 1 实例 × N=5 rollouts 全链路（env → agent → 回报） | 轨迹格式正确；patch 解析与回报可解释（gemma-4 冒烟 reward 1.83、qwen3.5-4B demo reward 中位 2.25）；replay 前缀一致性校验通过；容器无泄漏 |
-| **M2 单实例 MCTS** ✅（引擎完成，真实标注待验） | rollout → MC 门控 → 选择 → 二分 → best/leaf/add | 合成测试（ReARTeR 数值示例，65 个单测）通过 ✅；真实实例标注语义正确 —— **待验证项**：10 样本 demo 因 θ=0.5 全对未触发门控，需 `--reward-threshold 2.0` 重跑 |
-| **M3 并发管道** ✅（引擎完成，实机批量待验） | 500–2000 实例批量生成，断点续跑 | 引擎单测覆盖并发/预算/续跑 ✅；10 样本 demo 50 rollouts / 77s / 0 失败（吞吐基线 ~40 rollouts/min @ 并发 40）；`--resume` 可续、容器无泄漏待批量验证 |
+| **M2 单实例 MCTS** ✅（2026-09-08 实机批量验证） | rollout → MC 门控 → 选择 → 二分定位（标注 v5 派生：leaf/连续标签） | 合成测试（ReARTeR 数值示例）通过 ✅；2000 树实测：964 树门控、leaf 派生 2,412（433 实例）、消费会话 20,465，标注语义正确 |
+| **M3 并发管道** ✅（2026-09-08 实机批量完成） | 500–2000 实例批量生成，断点续跑 | 引擎单测覆盖并发/预算/续跑 ✅；10 样本 demo 50 rollouts / 77s / 0 失败（吞吐基线 ~40 rollouts/min @ 并发 40）；`--resume`/`kill -9` 恢复验证通过、容器无泄漏（2000 树 / 116,444 rollouts / 0 失败树） |
 | **M4 PRM 训练** | 数据集 + PEFT LoRA 训练 + 评估 | dev 步级准确率 ≥ 基线（随机/多数类）；best-of-N 相对随机选择有提升 |
 | **M5 交付** | 全量数据 + 评估报告 + 本文档更新 | 报告包含：数据统计、训练曲线、相关性、样例；为阶段 2（PRM 引导筛选 + KTO/DPO）提供直接输入 |
 
