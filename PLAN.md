@@ -60,7 +60,7 @@
   新容器里确定性重放（注入记录到的 observation），精确还原前缀容器状态后切换自由生成。无需修改 mini-swe-agent 源码。
 - **D4 并发模型（v2）**：单机多 worker（asyncio 驱动 + 线程池执行 litellm/docker exec 阻塞调用），
   **容器不复用**（每 rollout 新建、完成即销毁，`EnvFactory` 限并发创建数），全局信号量限流，
-  SQLite 持久化（rollout 完成即落 + 树定期快照）+ 幂等断点续跑（详见 §2.3 与 docs/mcts_engine_design.md）。
+  SQLite 持久化（rollout 完成即落；v5 起三表 + 会话原子提交 + 整树恢复，见施工文件 docs/construction/01–04）。
 - **D5 PRM 训练**：transformers + **PEFT（LoRA）** + 分类头（Qwen2.5-Math-PRM 风格：步尾 token 的 logit 做 sigmoid 二分类；
   或线性头），二分类 CE loss，单卡 A800，bf16。
 - **D6 数据防泄漏**：PRM 各 split 按 **repo 级**划分（同仓库实例不跨 split，对齐 CodeScout §4.1 的 128 repos 无重叠原则）。
@@ -219,7 +219,7 @@ M0 除 `mcts/` 包外，另提供一键执行与运维脚本（均已在 A800 �
 > 全局信号量限流）→ TreeDriver（每实例一棵树，`await gather(*submit(N))` 实现**节点内 N 次
 > rollout 并发**；多 TreeDriver 同时跑 ⇒ **多树并发**）→ EnvFactory（容器**创建即用、用完即销毁**，
 > 不复用、无 key、不限总创建次数，只限并发创建数）→ StateStore（SQLite：树与结果常驻内存、
-> rollout 完成即落 + 树定期快照）。模块：`mcts/{tasks,executor,replay,steps,reward,llm,node,
+> rollout 完成即落 + 会话原子提交）。模块：`mcts/{tasks,executor,replay,steps,reward,llm,node,
 > locate,store,run_mcts}.py`；入口 `python -m mcts.run_mcts`（`--sample/--instance-ids/
 > --concurrency/--create-concurrency/--max-rollouts/--resume/--dry-run/--phoenix-tracing`）。
 > 单测 `mcts/tests/` 62 个全部通过（本地 + A800）。
@@ -252,7 +252,7 @@ M0 除 `mcts/` 包外，另提供一键执行与运维脚本（均已在 A800 �
 select_best_node / locate_error / best-leaf-add 标注）与 OmegaPRM 论文；差异点在于**续跑机制与回报函数**。
 
 > ✅ **已实现（2026-08-27）**：`mcts/node.py`（MCTSNode / MC / QU 选择，纯函数）、
-> `mcts/locate.py`（`locate_error` 二分 + 标注条目构建，异步任务驱动）、`mcts/steps.py`
+> `mcts/locate.py`（`locate_error` 二分，返回 expanded/leaf，异步任务驱动）、`mcts/steps.py`
 > （轨迹 → 步序列）、`mcts/replay.py`（D3 前缀回放 + 自由续跑）。树逻辑通过任务队列与
 > rollout 执行解耦（`get_node` / `perform_rollouts` 注入），ReARTeR docs/01 §11.1–11.9
 > 数值示例端到端复现（单测锁定 QU 数值与标注顺序）。
@@ -295,7 +295,7 @@ select_best_node / locate_error / best-leaf-add 标注）与 OmegaPRM 论文；�
 
 ### 3.1 PRM 数据构建
 
-- **输入**：§2.4 的 best/leaf/add 标注 + 对应轨迹前缀。
+- **输入**：nodes/rollouts（v5 派生：leaf = 非 root∧mc==0 负样本、0<mc<1 连续标签）+ prefix_json + head 还原的轨迹前缀。
 - **样本展开**：每条标注 → 步级样本 `(instance_id, step_idx, prompt=完整对话到 step_idx-1, step_content, label)`：
   - **主标签（二值，OmegaPRM 式）**：由 leaf 定位结果回填——`leaf` 前的步正确（1）、`leaf` 所在步错误（0）、之后步不参与；
     `add/best` 的 MC 作为连续辅助标签（保留用于回归式训练对照）；
@@ -359,7 +359,7 @@ CodeAgentRL/
 │   ├── train_prm.py           # PEFT LoRA + 分类头 CE（§3.2）
 │   └── eval_prm.py            # 步级指标 / 相关性 / best-of-N（§3.3）
 └── outputs/
-    ├── mcts/                  # ✅ instances/splits.parquet + 数据报告；rollouts / annotations / 状态（M1+）
+    ├── mcts/                  # ✅ instances/splits.parquet + 数据报告；state.db（v5 三表）+ 派生标注（M1+）
     └── prm/                   # train|dev|test.parquet / ckpt / eval_report.md
 ```
 
