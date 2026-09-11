@@ -1,8 +1,32 @@
 # M4 PRM 训练 Runbook（实机 A800 交接）
 
-> 阶段 2（M4）代码已全部落地（commit `0d666dc` → `4c7f19b`，见
+> 阶段 2（M4）代码已全部落地（commit `0d666dc` → `eabf1a9`，见
 > `docs/prm_training_plan.md` §13.2）。离线/单测路径已在沙箱完成；以下步骤
 > 需要 GPU 与 CodeAgentRL-PRM 环境，在实机执行。执行前通读 §1.2 与本文件。
+
+## GPU 可用性现状（2026-09 记录，跨会话备忘）
+
+- **宿主机驱动正常**：内核模块 595.84，两块 A800 80GB 见 `/proc/driver/nvidia/gpus/`。
+- **沙箱/会话命名空间的 `/dev` 缺 NVIDIA 设备节点**（会话启动早于驱动修复），
+  导致 `nvidia-smi` 失败、`torch.cuda.is_available()=False`。修复方式二选一：
+  1. 重启会话（推荐，新命名空间自动带节点）；
+  2. 宿主机 shell 手动补节点（主次号取自 `/proc/devices`：nvidia=195、uvm=507）：
+     ```bash
+     sudo mknod -m 666 /dev/nvidiactl c 195 255
+     sudo mknod -m 666 /dev/nvidia0 c 195 0
+     sudo mknod -m 666 /dev/nvidia1 c 195 1
+     sudo mknod -m 666 /dev/nvidia-uvm c 507 0
+     sudo mknod -m 666 /dev/nvidia-uvm-tools c 507 1
+     ```
+- **`.venv-prm` 已装 CUDA 版 torch 2.14.0+cu130**（完整 CUDA 13 运行时），
+  节点就绪即可用；venv 的 `pip.conf` 已固化清华源
+  （`https://pypi.tuna.tsinghua.edu.cn/simple`）。
+- **节点就绪的自检顺序**：
+  ```bash
+  nvidia-smi                                   # 两块 A800 可见
+  .venv-prm/bin/python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
+  .venv-prm/bin/python -m pytest test/test_prm_model.py -k TestRealModelGpu -v   # 2 个 GPU 门控测试转绿
+  ```
 
 ## 已完成（沙箱/离线，截至本文）
 
