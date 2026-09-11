@@ -215,6 +215,10 @@ class TrajectoryPreprocessor:
         tok = self.tokenizer
         if tok is not None:
             ids = tok.apply_chat_template(messages, tokenize=True, **CHAT_TEMPLATE_KWARGS)
+            if hasattr(ids, "input_ids"):     # transformers 5.x 返回 BatchEncoding
+                ids = ids.input_ids
+            if ids and isinstance(ids[0], (list, tuple)):
+                ids = ids[0]
             return int(len(ids))
         text = self._approx_text(messages)
         return max(1, round(len(text) / APPROX_CHARS_PER_TOKEN))
