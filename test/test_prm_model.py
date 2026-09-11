@@ -9,6 +9,7 @@ z = 两 token logit 差、加权 soft-BCE 与手算一致、padded 前后分数�
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -191,3 +192,64 @@ class TestVerdictLoss:
         l_soft = verdict_loss(z, torch.tensor([0.8]), 1.0, 1.0)
         assert l_y1 < l_soft < l_y0
         assert verdict_loss(z, torch.tensor([0.8])) < verdict_loss(-z, torch.tensor([0.8]))
+
+
+# ---------------------------------------------------------------------------
+# 真实 Qwen3.5-4B + GPU 端到端（CUDA 门控：无 GPU 自动跳过；A800 上 ~1 分钟）
+# ---------------------------------------------------------------------------
+
+class TestRealModelGpu:
+    """M4.0 前置验证：真实基座在 GPU 上可加载、可前向、打分非退化。
+
+    基座/tokenizer 路径经 ``PRM_TEST_TOKENIZER``（默认 /media/shared_e/models/
+    Qwen3.5-4B）；模型文件缺失或无 GPU 时整类 skip，不误报失败。
+    """
+
+    REAL_MODEL = os.environ.get("PRM_TEST_TOKENIZER", "/media/shared_e/models/Qwen3.5-4B")
+
+    def _load_scorer_on_gpu(self):
+        from transformers import AutoTokenizer
+        from prm.modeling import VerdictScorer
+
+        path = self.REAL_MODEL
+        if not Path(path, "config.json").exists():
+            pytest.skip(f"基座不存在: {path}")
+        tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        ids = resolve_verdict_ids(tok)
+        scorer = VerdictScorer.from_pretrained(
+            path, ids, torch_dtype=torch.bfloat16,
+            attn_implementation="sdpa").to("cuda")
+        scorer.eval()
+        return scorer, tok
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA GPU")
+    def test_real_model_forward_on_gpu(self):
+        scorer, tok = self._load_scorer_on_gpu()
+        assert next(scorer.parameters()).dtype == torch.bfloat16
+        assert next(scorer.parameters()).device.type == "cuda"
+
+        # 真 tokenizer 渲染（F3：nothink 生成提示含空 think 块）→ collator → 前向
+        from prm.data import VerdictCollator
+        collator = VerdictCollator(tokenizer=tok, max_length=4096)
+        batch = collator([
+            {"messages": make_tiny_messages(2), "label": 1.0},
+            {"messages": make_tiny_messages(1), "label": 0.0},
+        ])
+        with torch.no_grad():
+            z = scorer(batch["input_ids"].to("cuda"),
+                       batch["attention_mask"].to("cuda"))
+        assert z.shape == (2,)
+        assert torch.isfinite(z).all()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA GPU")
+    def test_real_model_scores_not_degenerate(self):
+        """未训练基座缩微方向检查：不同前缀的 z 应有离散度而非常数（M4.0 前置）。"""
+        scorer, tok = self._load_scorer_on_gpu()
+        from prm.data import VerdictCollator
+        collator = VerdictCollator(tokenizer=tok, max_length=4096)
+        batch = collator([{"messages": make_tiny_messages(n), "label": 1.0}
+                          for n in (1, 2, 3)])
+        with torch.no_grad():
+            z = scorer(batch["input_ids"].to("cuda"),
+                       batch["attention_mask"].to("cuda"))
+        assert float(z.float().std()) > 0
