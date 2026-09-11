@@ -40,7 +40,7 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "mcts*"]
+include = ["agent*", "mcts*", "prm*"]
 exclude = ["mcts.tests*", "*.tests"]
 
 [tool.pytest.ini_options]

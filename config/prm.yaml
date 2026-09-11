@@ -1,0 +1,84 @@
+# CodeAgentRL —— PRM（阶段 2 / M4）全部配置
+#
+# 依据：docs/prm_training_plan.md。硬约束：
+#   - outputs/batch500/state.db 严格只读（prm/raw.py::open_db_readonly 强制）；
+#   - 训练模型仅 Qwen3.5-4B（/media/shared_e/models/Qwen3.5-4B 本地已有）；
+#   - verdict 打分 = Correct/Incorrect 单 token 差（F2）；标签 = 混合 soft
+#     （0.8·binary + 0.2·soft，§5.2）。
+#
+# 使用：
+#   python -m prm.build_dataset --config config/prm.yaml [CLI 覆盖项]
+#   python -m prm.train_prm     --config config/prm.yaml --run <name>
+#   python -m prm.eval_prm      --config config/prm.yaml --run <name>
+
+# ---------------------------------------------------------------------------
+# 数据构建（prm/build_dataset.py）
+# ---------------------------------------------------------------------------
+db:
+  path: outputs/batch500/state.db        # MCTS 树库（~5GB，只读）
+splits:
+  path: outputs/mcts/splits.parquet      # M0 三层划分（prm_split 防泄漏）
+output:
+  dir: outputs/prm
+
+# tokenizer 目录：精确 rendered_tokens 计长用（CodeAgentRL-PRM 环境）。
+# 置 null 时走 3.5 chars/token 近似（CodeAgentRL 环境核准路径，报告标注 approx）。
+tokenizer: /media/shared_e/models/Qwen3.5-4B
+
+build:
+  min_rollouts: 3          # 节点最少 rollout 数（§2.1-2，有效证据不足不进训练集）
+  leaf_chain: true         # leaf 链式回填（§5.1：末步 0、前序回填 1）
+  soft_label_weight: 0.2   # 混合 soft：label = 0.8·binary + 0.2·soft（§5.2）
+  class_weight_cap: 4.0    # w_neg 上限（§5.2，预期 ≈5.56:1 触顶 4）
+  workers: 1               # 并行进程数（实机构建建议 8）
+  overwrite: false
+  mc_mismatch_tol: 1.0e-6  # 重算 MC vs 缓存差异容忍（§2.1-4，超限跳过并审计）
+  length_candidates: [8192, 16384, 32768]  # length_report 覆盖率/截断率候选（§6）
+
+# ---------------------------------------------------------------------------
+# 训练（prm/train_prm.py，§7/§8）
+# ---------------------------------------------------------------------------
+train:
+  base_model: /media/shared_e/models/Qwen3.5-4B   # 仅此一个模型（F7）
+  max_length: 16384         # §6：由 length_report 确定后定稿（v1 预期 16K 量级）
+  verdict_pair: ["Correct", "Incorrect"]          # 备选 ["Yes","No"]、["对","错"]（§12）
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    bias: none
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  batch:
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16          # 有效 batch = 16
+  lr: 1.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.05
+  num_train_epochs: 2
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  bf16: true
+  gradient_checkpointing: true
+  use_cache: false
+  attn_implementation: flash_attention_2    # 不可用自动回退 sdpa
+  seed: 42
+  eval_steps: 1000                          # ≈ 每 epoch 2 次评估（§8）
+  save_steps: 1000
+  save_total_limit: 2
+  metric_for_best_model: dev_auc            # 选优主指标（§9.2）
+  greater_is_better: true
+  early_stopping_patience: 3                # 按 eval 次数计
+
+# ---------------------------------------------------------------------------
+# 评估（prm/probe.py / prm/eval_prm.py，§9）
+# ---------------------------------------------------------------------------
+eval:
+  batch_size: 8
+  probe:
+    n_samples: 500          # M4.0 零训练侦察：dev 抽样量
+    seed: 42
+  best_of:
+    k: 5                    # 每实例 ≤5 条 root rollouts
+    selectors: [random, shortest, prm_mean, prm_min, prm_last, oracle]
+    bootstrap_n: 1000       # 差值 95% CI（§9.2）
+    gamma: 0.95             # 轨迹级 discounted 聚合
