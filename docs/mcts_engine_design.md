@@ -1,6 +1,6 @@
 # MCTS 高并发 Rollout 引擎设计（v2：任务驱动 + 容器不复用 + SQLite 持久化）
 
-> 对应 PLAN §2.3 / §2.4 / §4（mcts/{node,locate,replay,tasks,executor,store,run_mcts}.py），
+> 对应 Overall_PLAN.md「阶段 1 引擎与设计模式」（mcts/{node,locate,replay,tasks,executor,store,run_mcts}.py），
 > 里程碑 M1–M3。本文档是"高并发 MCTS 数据生成引擎"的权威设计；代码以本设计为准。
 >
 > **v2 变更（2026-08-27 评审确认）**：

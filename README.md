@@ -369,6 +369,6 @@ python -m pytest test/ -v --run-integration   # 含真实 Docker 集成测试（
 - [x] 阶段 0：Agent 执行层 —— Docker 环境管理（init_env）、mini-swe-agent 集成（base_agent）、轨迹输出
 - [x] 基础设施：Phoenix 观测平台独立环境部署 + litellm 轨迹上报客户端（可选，见 §7）
 - [x] 阶段 1 · M0：数据预处理 —— `mcts/` 包（instances 读取/过滤/gold、splits 三层划分、env 环境准备），
-  产出 `outputs/mcts/{instances,splits}.parquet` + 数据报告（39,284 实例 / 131 repos，详见 PLAN.md）
+  产出 `outputs/mcts/{instances,splits}.parquet` + 数据报告（39,284 实例 / 131 repos，详见 Overall_PLAN.md）
 - [ ] 阶段 1：MCTS 过程监督数据生成（把 OmegaPRM 迁移到 Issue Fix 域）→ PRM 训练
 - [ ] 阶段 2：PRM 引导的高质量轨迹筛选 → KTO/DPO 训练 Issue Fix Agent → SWE-bench 评估

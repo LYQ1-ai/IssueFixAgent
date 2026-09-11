@@ -2,7 +2,7 @@
 
 > 面向后续修改与开发：完整阐述当前 MCTS 数据生成引擎的**失败判定、重试、落库、断点续跑
 > 与崩溃恢复**机制，包括涉及文件、数据模型、已知问题与修复记录、后续开发建议。
-> 配合阅读：`PLAN.md §2.3–2.4`、`docs/mcts_engine_design.md`、`docs/reward_design.md`。
+> 配合阅读：`Overall_PLAN.md`、`docs/mcts_engine_design.md`、`docs/reward_design.md`。
 > 最后更新：2026-09-01（含当日 head 缺失 / 失败固化 / 标注删减三处修复与遗留问题）。
 
 ---
@@ -154,7 +154,7 @@ annotations(id AUTOINC, instance_id, node_key, type, mc_score, n_steps, written_
 
 | 局限 | 影响 | 状态 |
 | --- | --- | --- |
-| 状态机不重建 | resume 重新决策（CPU 重跑 + 少量新 probe） | 后置项（PLAN §5） |
+| 状态机不重建 | resume 重新决策（CPU 重跑 + 少量新 probe） | 后置项（v5 已实现，见 Overall_PLAN.md §4.4） |
 | probe 节点全失败 → `compute_mc()=0` → 记 leaf | 全失败被当"全错"，可能误标负样本 | 待改进 |
 | `_write_annotations` 无条件执行 | **head 缺失跳过扩展时会把旧标注 DELETE 成空**（9/1 期间发生过 ~3100 条标注损失） | **待加保护**（见 §9.1） |
 | 历史失败记录固化 | 8/31 前落库的 error 记录被 resume 当作"已有"不重跑（当前 DB 10,696 条） | 待清理（见 §9.2） |

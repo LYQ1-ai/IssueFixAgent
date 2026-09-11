@@ -1,6 +1,6 @@
 # 施工文件 00 —— 总览与改造范围（MCTS 引擎 v5 重构）
 
-> 配套阅读：`docs/mcts_fault_tolerance.md`（容错现状）、`docs/mcts_engine_design.md`（v2 引擎设计）、`PLAN.md §2.3–2.4`。
+> 配套阅读：`docs/mcts_fault_tolerance.md`（容错现状）、`docs/mcts_engine_design.md`（v2 引擎设计）、`Overall_PLAN.md`（项目总览）。
 > 本组文档（00–05）是 **v5 状态机 + 会话原子提交 + 精简表设计** 的实施规格，基于 2026-09 系列设计评审结论。
 
 ---
