@@ -40,7 +40,9 @@ build:
 # ---------------------------------------------------------------------------
 train:
   base_model: /media/shared_e/models/Qwen3.5-4B   # 仅此一个模型（F7）
-  max_length: 16384         # §6：由 length_report 确定后定稿（v1 预期 16K 量级）
+  max_length: 16384         # 已定稿（§6 步骤 3）：真实 tokenizer length_report
+                            # p95=16169，16K 覆盖率 95.2%（剩余 4.8% 由 §7.2
+                            # 训练期动态截断兜底）；32768 覆盖 99.6% 备选
   verdict_pair: ["Correct", "Incorrect"]          # 备选 ["Yes","No"]、["对","错"]（§12）
   lora:
     r: 16
