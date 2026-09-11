@@ -83,6 +83,8 @@ class PrmParquetDataset:
             "label_source": row["label_source"],
             "mc_score": row["mc_score"],
             "rendered_tokens": row["rendered_tokens"],
+            "step_index": int(row["step_index"]),
+            "step_count": int(row["step_count"]),
             "messages": load_messages(row["messages"]),
         }
 
@@ -264,7 +266,13 @@ class VerdictCollator:
         return list(out)
 
     def __call__(self, batch: list[dict]) -> dict:
-        """``[{"messages": [...], "label": float}, ...]`` → 训练张量批（右 padding）。"""
+        """``[{"messages": [...], "label": float}, ...]`` → 训练张量批（右 padding）。
+
+        直接产出 torch 张量（HF Trainer 的 data_collator 约定）；离线无 torch
+        环境的单测经 ``tensors_from`` / 列表访问另行处理。
+        """
+        import torch  # 惰性（CodeAgentRL 环境无 torch）
+
         self.stats["n_batches"] += 1
         self.stats["n_samples"] += len(batch)
         seqs: list[list[int]] = []
@@ -292,18 +300,19 @@ class VerdictCollator:
             input_ids.append(s + [pad_id] * pad)
             attention_mask.append([1] * len(s) + [0] * pad)
         return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.float32),
         }
 
 
 def tensors_from(batch: dict, device: Optional[str] = None):
-    """collator 输出 → torch 张量（惰性导入 torch；list[int] 便于离线测试）。"""
+    """collator 输出 → torch 张量（惰性导入 torch；兼容已是张量的输入）。"""
     import torch  # 惰性（CodeAgentRL 环境无 torch）
 
     def _t(x, dtype):
-        t = torch.tensor(x, dtype=dtype)
+        t = x if isinstance(x, torch.Tensor) else torch.tensor(x)
+        t = t.to(dtype)
         return t.to(device) if device else t
 
     return {

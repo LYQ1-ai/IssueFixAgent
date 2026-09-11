@@ -68,6 +68,15 @@ def make_trainer_class():
                 return (loss.detach(), None, None)
             return (loss.detach(), z, inputs["labels"])
 
+        def _save(self, output_dir, state_dict=None):
+            """覆写：走 VerdictScorer.save_pretrained（tie 权重去重 + adapter 镜像）。
+
+            transformers 5.x 的默认 `_save` 直接 ``safetensors.save_file(state_dict)``
+            不处理共享张量——``tie_word_embeddings=True``（F1）会报
+            "Some tensors share memory"。模型的 save_pretrained 负责去重。
+            """
+            self.model.save_pretrained(output_dir)
+
     return VerdictTrainer
 
 
@@ -88,6 +97,22 @@ def make_compute_metrics():
 # ---------------------------------------------------------------------------
 # 训练入口
 # ---------------------------------------------------------------------------
+
+def _warmup_steps(warmup_ratio: float, train_ds, per_device_bs: int, accum: int,
+                  epochs: float, max_steps: int) -> int:
+    """换算 warmup 步数（transformers 5.x 移除 warmup_ratio）。
+
+    总步数与 Trainer 同口径：``ceil(N / (bs·accum)) · epochs``（或显式 max_steps）；
+    warmup ≥ 1 步。
+    """
+    if max_steps > 0:
+        total = max_steps
+    else:
+        import math
+        steps_per_epoch = math.ceil(len(train_ds) / max(1, per_device_bs * accum))
+        total = max(1, int(steps_per_epoch * epochs))
+    return max(1, int(round(warmup_ratio * total)))
+
 
 def train(cfg: dict, run_name: str, *, smoke: bool = False,
           max_length: Optional[int] = None) -> Path:
@@ -144,15 +169,20 @@ def train(cfg: dict, run_name: str, *, smoke: bool = False,
     logger.info("可训练参数: %.2fM（LoRA=%s）", n_trainable / 1e6, bool(lora))
 
     set_seed(int(train_cfg.get("seed", 42)))
+    batch_size = int(batch_cfg.get("per_device_train_batch_size", 1))
+    accum = int(batch_cfg.get("gradient_accumulation_steps", 16))
+    epochs = float(train_cfg.get("num_train_epochs", 2)) if not smoke else 1.0
+    smoke_max_steps = int(train_cfg.get("smoke_max_steps", 20)) if smoke else -1
     args = TrainingArguments(
         output_dir=str(run_dir / "checkpoints"),
-        per_device_train_batch_size=int(batch_cfg.get("per_device_train_batch_size", 1)),
-        gradient_accumulation_steps=int(batch_cfg.get("gradient_accumulation_steps", 16)),
+        per_device_train_batch_size=batch_size,
+        gradient_accumulation_steps=accum,
         learning_rate=float(train_cfg.get("lr", 1e-4)),
         lr_scheduler_type=train_cfg.get("lr_scheduler_type", "cosine"),
-        warmup_ratio=float(train_cfg.get("warmup_ratio", 0.05)),
-        num_train_epochs=float(train_cfg.get("num_train_epochs", 2)) if not smoke else 1.0,
-        max_steps=int(train_cfg.get("smoke_max_steps", 20)) if smoke else -1,
+        warmup_steps=_warmup_steps(float(train_cfg.get("warmup_ratio", 0.05)),
+                                   train_ds, batch_size, accum, epochs, smoke_max_steps),
+        num_train_epochs=epochs,
+        max_steps=smoke_max_steps,
         bf16=bool(train_cfg.get("bf16", True)) and torch.cuda.is_available(),
         gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", True)),
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -164,7 +194,6 @@ def train(cfg: dict, run_name: str, *, smoke: bool = False,
         save_strategy="steps",
         save_steps=int(train_cfg.get("save_steps", 1000)),
         save_total_limit=int(train_cfg.get("save_total_limit", 2)),
-        save_safetensors=True,
         load_best_model_at_end=bool(dev_ds),
         metric_for_best_model=str(train_cfg.get("metric_for_best_model", "dev_auc")),
         greater_is_better=bool(train_cfg.get("greater_is_better", True)),

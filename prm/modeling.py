@@ -78,6 +78,8 @@ class VerdictScorer(nn.Module):
         self.backbone = backbone
         self.id_correct, self.id_incorrect = int(verdict_ids[0]), int(verdict_ids[1])
         self.config = getattr(backbone, "config", None)
+        # HF Trainer 兼容属性（5.x save 路径读取）
+        self._keys_to_ignore_on_save: list[str] = []
         self._freeze_verdict_rows()
 
     # ------------------------------------------------------------------

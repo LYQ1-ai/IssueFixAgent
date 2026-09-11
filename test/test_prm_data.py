@@ -85,11 +85,10 @@ class TestNoTruncation:
         n1 = len(c._encode(batch[0]["messages"]))
         n3 = len(c._encode(batch[1]["messages"]))
         assert n3 > n1
-        assert out["attention_mask"][0] == [1] * n1 + [0] * (n3 - n1)  # 短行右侧补 0
-        assert out["attention_mask"][1] == [1] * n3
-        assert out["input_ids"][0][n1:] == out["input_ids"][0][n1 - 1:n1] * (n3 - n1) \
-            or len(set(out["input_ids"][0][n1:])) == 1  # pad token 恒定
-        assert out["labels"] == [0.8, 0.2]
+        assert out["attention_mask"][0].tolist() == [1] * n1 + [0] * (n3 - n1)  # 短行右侧补 0
+        assert out["attention_mask"][1].tolist() == [1] * n3
+        assert len(set(out["input_ids"][0][n1:].tolist())) == 1  # pad token 恒定
+        assert out["labels"].tolist() == pytest.approx([0.8, 0.2])
 
     def test_single_vs_batch_token_ids_identical(self, tok):
         """逐条 vs 批量（含 padding）token 序列一致（§7.1-3 的前提）。"""
@@ -97,8 +96,8 @@ class TestNoTruncation:
         msgs = make_tiny_messages(2)
         single = c._encode(c.truncate_messages(msgs))
         batched = c([{"messages": msgs, "label": 1.0}])
-        assert batched["input_ids"][0][:len(single)] == single
-        assert all(v == 0 for v in batched["attention_mask"][0][len(single):])
+        assert batched["input_ids"][0][:len(single)].tolist() == list(single)
+        assert all(v == 0 for v in batched["attention_mask"][0][len(single):].tolist())
 
     def test_stats_counters(self, tok):
         c = _make_collator(tok, 4096)
