@@ -135,9 +135,55 @@ class VerdictScorer(nn.Module):
         lm_head = getattr(self.backbone, "get_output_embeddings", lambda: None)()
         self.tied_output = lm_head is not None and lm_head.weight is embed.weight
 
+    def set_verdict_ids(self, verdict_ids: tuple[int, int]) -> None:
+        """更换 verdict token 对（M4.0 备选对复测），并重注册冻结 hook。"""
+        self.id_correct, self.id_incorrect = int(verdict_ids[0]), int(verdict_ids[1])
+        if getattr(self, "_verdict_hook", None) is not None:
+            self._verdict_hook.remove()
+        self._freeze_verdict_rows()
+
     def trainable_parameters(self):
         """仅返回 requires_grad=True 的参数（单参数组，§8 lr 表）。"""
         return (p for p in self.parameters() if p.requires_grad)
+
+    # ------------------------------------------------------------------
+    # HF Trainer 兼容委托（gradient checkpointing / 保存 / 最优权重回载）
+    # ------------------------------------------------------------------
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        return self.backbone.gradient_checkpointing_enable(**kwargs)
+
+    def gradient_checkpointing_disable(self):
+        return self.backbone.gradient_checkpointing_disable()
+
+    def enable_input_require_grads(self, **kwargs):
+        return self.backbone.enable_input_require_grads(**kwargs)
+
+    def state_dict(self, *args, **kwargs):
+        """委托 backbone（Trainer 保存/回载最优权重的键空间一致）。"""
+        return self.backbone.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        return self.backbone.load_state_dict(*args, **kwargs)
+
+    def save_pretrained(self, out_dir, **kwargs) -> None:
+        """保存可复现加载的最小产物。
+
+        - LoRA：``backbone.save_pretrained``（``adapter_model.safetensors`` +
+          ``adapter_config.json``，计划 §8），并镜像一份 ``model.safetensors``
+          供 Trainer 的 load_best_model_at_end 通用回载路径使用（adapter 很小，
+          双写可忽略）；
+        - 全量微调：backbone.save_pretrained 直接产出 ``model.safetensors``。
+        """
+        from pathlib import Path
+        import shutil
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        self.backbone.save_pretrained(str(out))
+        is_peft = getattr(self.backbone, "peft_config", None) is not None
+        adapter = out / "adapter_model.safetensors"
+        if is_peft and adapter.exists():
+            shutil.copyfile(adapter, out / "model.safetensors")
 
     # ------------------------------------------------------------------
     # forward
@@ -156,19 +202,6 @@ class VerdictScorer(nn.Module):
     def predict_proba(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """p = σ(z)（评估/probe 用）。"""
         return torch.sigmoid(self(input_ids, attention_mask))
-
-    # ------------------------------------------------------------------
-    # 保存 / 加载（LoRA adapter + manifest）
-    # ------------------------------------------------------------------
-
-    def save_pretrained(self, out_dir: str) -> None:
-        """保存可复现加载的最小产物：LoRA adapter（若有）+ tokenizer 之外的元数据
-        由 train_prm 的 manifest 记录。全量微调时保存完整权重。"""
-        peft_model = getattr(self.backbone, "peft_config", None)
-        if peft_model:
-            self.backbone.save_pretrained(out_dir)  # adapter_model.safetensors
-        else:
-            self.backbone.save_pretrained(out_dir)
 
 
 def _apply_lora(backbone: nn.Module, lora: dict) -> nn.Module:
