@@ -31,3 +31,6 @@ scripts/extract_pdf_text.mjs
 .idea/
 .vscode/
 *.iml
+
+# 本地轮子（如 flash-attn 预编译轮 ~244MB，勿入库）
+*.whl

@@ -161,6 +161,7 @@ docker build -t codeagentrl-agent:ubuntu24 -f agent/Dockerfile .
 | `MSWEA_MAX_OUTPUT_CHARS` | `10000` | shell_tool 输出截断长度（head+tail，防上下文爆炸） |
 | `MSWEA_MAX_CONCURRENT` | `4` | 同一容器最大并发 docker exec（0 = 不限） |
 | `CODEAGENTRL_TEST_IMAGE` | 自动探测 | 集成测试用镜像（默认优先 `codeagentrl-agent:ubuntu24`） |
+| `CUDA_VISIBLE_DEVICES` | `0`（.env） | **PRM 用哪张卡**：由仓库根 `.env` 决定，由 `python -m prm.*` 各 CLI 入口装载（包导入不装载）；进程内 `cuda:0` 即选中卡（见 `prm/env.py`、`docs/prm_training_plan.md` §14.5） |
 
 完整清单与逐项说明见 `.env_template`。
 
