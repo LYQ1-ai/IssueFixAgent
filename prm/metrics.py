@@ -314,6 +314,20 @@ def select_rollout(rollouts: list[dict], selector: str, *,
     raise ValueError(f"未知选择器: {selector}")
 
 
+def cap_candidates(rollouts: Sequence[dict], k: int,
+                   key: str = "rollout_idx") -> list[dict]:
+    """按 ``key`` 升序取前 ``k`` 条候选（§9.2「每实例 ≤5 条 root rollouts」）。
+
+    ``k <= 0`` 表示不限制。固定候选数是 best-of-N 配对实验的前提：N 越大，
+    ``oracle = max(reward)`` 的期望越高、PRM 选择器的收益也越大，而 ``random``
+    的期望与 N 无关 → 各实例 N 不等会把「N 的差异」混进 ``vs random`` 的配对差 CI。
+    取前 k 条（而非随机抽样）保证同一份数据重复评估结果一致。
+    """
+    if k is None or int(k) <= 0:
+        return list(rollouts)
+    return sorted(rollouts, key=lambda r: r.get(key, 0))[:int(k)]
+
+
 def best_of_metrics(per_instance: list[dict], selectors: Sequence[str] = SELECTORS,
                     n_boot: int = 1000, seed: int = 42) -> dict:
     """best-of-N 指标（§9.2）：selected_reward / selected_correct / regret / win_rate，
@@ -373,5 +387,5 @@ __all__ = [
     "pearson", "spearman", "bootstrap_ci", "bucket_metrics",
     "position_bucket", "relative_position_bucket", "context_length_bucket",
     "discounted_aggregate", "rollout_aggregates", "select_rollout",
-    "best_of_metrics", "SELECTORS",
+    "best_of_metrics", "SELECTORS", "cap_candidates",
 ]

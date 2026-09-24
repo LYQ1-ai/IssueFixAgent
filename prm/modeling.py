@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Optional, Sequence
 
@@ -65,6 +66,33 @@ def verdict_loss(z: torch.Tensor, labels: torch.Tensor,
     return loss.mean()
 
 
+def _detect_logits_to_keep_kwarg(backbone: nn.Module) -> Optional[str]:
+    """探测 backbone 支持的「只算末位 logits」参数名。
+
+    transformers 5.x 用 ``logits_to_keep``、4.x 用 ``num_logits_to_keep``；
+    PEFT 包装层（PeftModel/LoraModel）的 ``forward`` 不含该参数，须先解包到
+    底层模型。返回 ``None`` 表示不支持（调用方回退全量 logits）。
+    """
+    mod = backbone
+    getter = getattr(mod, "get_base_model", None)   # PeftModel → 底层模型
+    if callable(getter):
+        try:
+            mod = getter()
+        except Exception:  # pragma: no cover - 解包失败不应影响打分
+            pass
+    forward = getattr(mod, "forward", None)
+    if forward is None:
+        return None
+    try:
+        params = inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return None
+    for name in ("logits_to_keep", "num_logits_to_keep"):
+        if name in params:
+            return name
+    return None
+
+
 class VerdictScorer(nn.Module):
     """backbone（Qwen3.5-4B，可选 PEFT LoRA）→ z = 两 verdict token logit 差。
 
@@ -80,6 +108,7 @@ class VerdictScorer(nn.Module):
         self.config = getattr(backbone, "config", None)
         # HF Trainer 兼容属性（5.x save 路径读取）
         self._keys_to_ignore_on_save: list[str] = []
+        self._logits_to_keep_kw = _detect_logits_to_keep_kwarg(backbone)
         self._freeze_verdict_rows()
 
     # ------------------------------------------------------------------
@@ -90,29 +119,42 @@ class VerdictScorer(nn.Module):
     def from_pretrained(cls, model_path: str, verdict_ids: tuple[int, int], *,
                         torch_dtype: torch.dtype = torch.bfloat16,
                         attn_implementation: str = "flash_attention_2",
-                        lora: Optional[dict] = None) -> "VerdictScorer":
+                        lora: Optional[dict] = None,
+                        use_kernels: bool = False) -> "VerdictScorer":
         """加载基座（可选包 LoRA）→ VerdictScorer。
 
         - 加载顺序回退：``AutoModelForCausalLM`` → ``AutoModelForImageTextToText``
           （Qwen3.5 官方权重是条件生成架构）；
         - ``attn_implementation`` 不可用（无 flash-attn）时由调用方降级 sdpa；
         - ``lora``: PEFT 配置 dict（r/alpha/dropout/bias/target_modules），为 None
-          则不包装（全量微调 / 推理）。
+          则不包装（全量微调 / 推理）；
+        - ``use_kernels``: 经 ``kernels`` 库启用 HF Hub 预编译内核
+          （``chunk_gated_delta_rule`` ← ``kernels-community/fla``、
+          ``causal_conv1d_fn/update`` ← ``kernels-community/mamba-ssm``）。
+          transformers 自带的 torch 版只是**可读参考实现**，官方源码注释称
+          ``chunk_gated_delta_rule`` 在 H100 上差**一个数量级以上**；本模型的
+          linear-attention 层占多数，故这是吞吐主开关（§14.6）。
+          要求 ``kernels`` 已安装（``0.16.x``），否则 ``from_pretrained`` 直接
+          抛 ``ValueError``；调用方负责回退。
         """
         from transformers import AutoConfig, AutoModelForCausalLM  # 惰性
+        load_kwargs = {"torch_dtype": torch_dtype,
+                       "attn_implementation": attn_implementation}
+        if use_kernels:
+            load_kwargs["use_kernels"] = True
         try:
-            backbone = AutoModelForCausalLM.from_pretrained(
-                model_path, torch_dtype=torch_dtype, attn_implementation=attn_implementation)
+            backbone = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
         except (ValueError, KeyError) as e:
             logger.warning("AutoModelForCausalLM 加载失败（%s），回退 ImageTextToText 架构", e)
             config = AutoConfig.from_pretrained(model_path)
             from transformers import AutoModelForImageTextToText
             backbone = AutoModelForImageTextToText.from_pretrained(
-                model_path, config=config, torch_dtype=torch_dtype,
-                attn_implementation=attn_implementation)
+                model_path, config=config, **load_kwargs)
         if lora:
             backbone = _apply_lora(backbone, lora)
-        return cls(backbone, verdict_ids)
+        scorer = cls(backbone, verdict_ids)
+        scorer.use_kernels = bool(getattr(backbone, "use_kernels", False))
+        return scorer
 
     # ------------------------------------------------------------------
     # verdict 行冻结（F1 tie 共享 → 梯度 hook 清零两行）
@@ -128,10 +170,14 @@ class VerdictScorer(nn.Module):
                 grad[r].zero_()
             return grad
 
-        # LoRA 场景 embedding 参数 requires_grad=False，hook 不会触发；
-        # 全量微调场景 hook 保证 verdict 两行梯度恒为 0（等效 requires_grad=False）。
-        handle = embed.weight.register_hook(_zero_verdict_rows)
-        self._verdict_hook = handle
+        # LoRA 场景 embedding 参数 requires_grad=False：此时 PyTorch 直接拒绝
+        # register_hook（"cannot register a hook on a tensor that doesn't require
+        # gradient"），故必须跳过注册；全量微调场景才注册，保证 verdict 两行
+        # 梯度恒为 0（等效 requires_grad=False）。
+        if embed.weight.requires_grad:
+            self._verdict_hook = embed.weight.register_hook(_zero_verdict_rows)
+        else:
+            self._verdict_hook = None
         self.verdict_rows = tuple(rows)
         # 共享矩阵（tie）时 lm_head.weight is embed.weight；记录断言信息
         lm_head = getattr(self.backbone, "get_output_embeddings", lambda: None)()
@@ -147,6 +193,24 @@ class VerdictScorer(nn.Module):
     def trainable_parameters(self):
         """仅返回 requires_grad=True 的参数（单参数组，§8 lr 表）。"""
         return (p for p in self.parameters() if p.requires_grad)
+
+    # ------------------------------------------------------------------
+    # 设备 / 内核
+    # ------------------------------------------------------------------
+
+    def to_device_and_kernelize(self, device) -> "VerdictScorer":
+        """搬到目标设备；若启用了 Hub 内核，**在设备上重新内核化**。
+
+        为什么必须重新内核化：``from_pretrained(use_kernels=True)`` 的 ``kernelize``
+        发生在**加载时的设备**上——不传 ``device_map`` 时模型在 CPU，而 Hub 内核映射
+        是按设备类型（``cuda``）匹配的，于是 CPU 上等于没换内核；之后 Trainer/调用方
+        ``.to("cuda")`` 只说"搬张量"，**不会**把参考实现换成 cuda 内核。
+        不设防的话就会得到"`use_kernels=True` 但一点没变快"的假结论（§14.6）。
+        """
+        self.to(device)
+        if self.use_kernels and str(device).startswith("cuda"):
+            self.backbone.set_use_kernels(True)   # kernelize(device=cuda)
+        return self
 
     # ------------------------------------------------------------------
     # HF Trainer 兼容委托（gradient checkpointing / 保存 / 最优权重回载）
@@ -192,18 +256,68 @@ class VerdictScorer(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """``(input_ids, attention_mask) -> z (B,)``；打分位置 = 最后一个非 pad token。"""
-        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        """``(input_ids, attention_mask) -> z (B,)``；打分位置 = 最后一个非 pad token。
+
+        **显存关键**：只计算末位 logits（``logits_to_keep=1``，切片发生在 lm_head
+        之前）。若算全量 ``(B, L, V)``，16K × 248,044 词表在 batch 8 下需约 65GB，
+        真机实测直接 OOM（2026-09-11 日志：`64353206272 bytes`）。
+
+        **位置安全**：collator 强制单样本批 → 不产生 padding → 「序列最后一个物理
+        位置」就是「最后一个非 pad 的真实 token」，位置切片因此精确。若批次含尾随
+        pad（右 padding，理论上只有绕过 collator 才可能出现），则回退全量 logits +
+        按 attention_mask 逐行取位（取位正确，但 pad 本身会污染混合层，见 §14.2）。
+
+        ``position_ids`` 显式给出是**防御性**写法：Qwen3.5 实测三种写法（默认
+        arange / cumsum−1 截断 / 严格递增）在同一样本上只差第 4 位小数，**不是**
+        padding 敏感性的来源（早期注释把成因归给 RoPE 偏移，实测已否定）。
+        """
+        position_ids = attention_mask.long().cumsum(dim=1) - 1
+        position_ids = position_ids.clamp_(min=0)
+        # 尾随 0（右 padding）计数：>0 时末位可能是 pad，快路径位置切片不可信
+        trailing_pad = int((attention_mask.flip(1).cumsum(dim=1) == 0).sum(dim=1).max().item())
+
+        if self._logits_to_keep_kw is not None and trailing_pad == 0:
+            try:
+                out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
+                                    position_ids=position_ids, use_cache=False,
+                                    **{self._logits_to_keep_kw: 1})
+                step_logits = out.logits[:, -1]              # (B, V)
+                return step_logits[:, self.id_correct] - step_logits[:, self.id_incorrect]
+            except TypeError as e:  # 参数名不被接受（自定义/包装模型）→ 记录并回退
+                logger.warning("backbone 不接受 %s（%s）→ 回退全量 logits（显存开销大）",
+                               self._logits_to_keep_kw, e)
+                self._logits_to_keep_kw = None
+
+        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
+                            position_ids=position_ids, use_cache=False)
         logits = out.logits  # (B, L, V)
-        last_non_pad = attention_mask.sum(dim=1) - 1          # 右 padding（§7.1-3）
+        last = (attention_mask.shape[1] - 1
+                - (attention_mask.flip(1).cumsum(dim=1) == 0).sum(dim=1))
         batch_idx = torch.arange(logits.size(0), device=logits.device)
-        step_logits = logits[batch_idx, last_non_pad]         # (B, V)
+        step_logits = logits[batch_idx, last]                   # (B, V)
         return step_logits[:, self.id_correct] - step_logits[:, self.id_incorrect]
 
     @torch.no_grad()
     def predict_proba(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """p = σ(z)（评估/probe 用）。"""
         return torch.sigmoid(self(input_ids, attention_mask))
+
+
+def kernelized_modules(model: nn.Module) -> list[str]:
+    """列出"不是 torch/transformers/peft 实现"的子模块类型全名。
+
+    用途：**验证 Hub 内核是否真的生效**（`use_kernels=True` 只是个意图，CPU 上加载
+    时它会静默变成空操作，见 `VerdictScorer.to_device_and_kernelize`）。
+    内核化会把这些层换成从 HF Hub 取来的实现，其类/函数的 ``__module__`` 落在
+    ``kernels`` 缓存或仓库命名空间里，于是能被这个过滤器挑出来。
+    """
+    keep = ("torch.", "transformers.", "peft.", "accelerate.", "triton.", "prm.")
+    names = set()
+    for m in model.modules():
+        mod = type(m).__module__
+        if not mod.startswith(keep):
+            names.add(f"{mod}.{type(m).__name__}")
+    return sorted(names)
 
 
 def _apply_lora(backbone: nn.Module, lora: dict) -> nn.Module:
@@ -226,6 +340,7 @@ def _apply_lora(backbone: nn.Module, lora: dict) -> nn.Module:
 
 __all__ = [
     "VerdictScorer",
+    "kernelized_modules",
     "resolve_verdict_ids",
     "verdict_loss",
 ]

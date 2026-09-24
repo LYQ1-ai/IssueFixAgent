@@ -51,7 +51,8 @@ train:
     bias: none
     target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
   batch:
-    per_device_train_batch_size: 1
+    per_device_train_batch_size: 1           # 强制 1（无 padding，见 §14.2）；有效 batch
+                                             # 由 gradient_accumulation_steps 提供
     gradient_accumulation_steps: 16          # 有效 batch = 16
   lr: 1.0e-4
   lr_scheduler_type: cosine
@@ -63,6 +64,13 @@ train:
   gradient_checkpointing: true
   use_cache: false
   attn_implementation: flash_attention_2    # 不可用自动回退 sdpa
+  # HF Hub 预编译内核（linear-attention 的 chunk_gated_delta_rule ← kernels-community/fla；
+  # causal_conv1d ← kernels-community/mamba-ssm）。**本机到 HF Hub 不可达**（2026-09-15
+  # 实测 httpx.ConnectTimeout [Errno 110]，kernels 解析 repo revision 时挂）→ 默认关闭，
+  # 免得每次启动白等一次连接超时。它不是必需项：卡空闲时 bench 实测单步 2.46 s、
+  # 前向+反向 3.47×（正常）。将来配好 HF 访问（HF_ENDPOINT 镜像 / HTTPS_PROXY）可改 true；
+  # 失败也是 fail-open（告警 + 回退参考实现，训练不受影响，见 _load_scorer）。
+  use_kernels: false
   seed: 42
   eval_steps: 1000                          # ≈ 每 epoch 2 次评估（§8）
   save_steps: 1000
@@ -70,12 +78,35 @@ train:
   metric_for_best_model: dev_auc            # 选优主指标（§9.2）
   greater_is_better: true
   early_stopping_patience: 3                # 按 eval 次数计
+  eval_max_samples: 500                     # dev 评估只评前 N 条（null = 全量 4,864）。
+                                            # bs=1 实测 4,864 条 = 35 min/次（2.32 条/s），
+                                            # 会把训练时间大半吃掉；500 条 ≈ 3.6 min，
+                                            # 且对齐 M4.0 probe 的抽样口径
+  smoke_eval_max_samples: 64                # 冒烟路径单独的上限（--smoke 时生效）：
+                                            # 20 步训练 10 min，全量评估 35 min → 冒烟钱
+                                            # 全花在评估上；64 条 ≈ 30 s
+
+  # 训练曲线记录（SwanLab）。官方流程：pip install swanlab → swanlab login → 训练
+  # 自动上报（实验名 = run 名）。云端参数：
+  #   workspace = 用户名/团队空间；project = 项目名（网页端按 project 分组）
+  #   mode: cloud → 需先 `swanlab login`（凭据存 ~/.netrc）或 export SWANLAB_API_KEY；
+  #                 两者都无时代码会**自动禁用上报并告警**，避免交互登录卡住训练
+  #   mode: local → 完全离线，日志落 log_dir（查看：swanlab watch outputs/prm/swanlog，
+  #                 需额外装 swanlab[dashboard]）
+  report_to: [swanlab]
+  swanlab:
+    project: CodeAgentRL
+    workspace: "2410104018"
+    mode: cloud
+    log_dir: outputs/prm/swanlog
 
 # ---------------------------------------------------------------------------
 # 评估（prm/probe.py / prm/eval_prm.py，§9）
 # ---------------------------------------------------------------------------
 eval:
-  batch_size: 8
+  batch_size: 1               # 强制 1（无 padding）：Qwen3.5 混合架构对 pad 前缀敏感，
+                              # 实测左 padding 使 σ(z) 偏移最多 +0.70、右 padding 也有
+                              # 0.02 量级偏差（计划书 §14.2）；collator/CLI 会拒绝 >1
   probe:
     n_samples: 500          # M4.0 零训练侦察：dev 抽样量
     seed: 42

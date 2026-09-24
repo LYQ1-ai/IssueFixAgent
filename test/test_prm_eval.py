@@ -271,6 +271,7 @@ class TestSummarizeSplit:
             "step_index": rng.integers(1, 10, n),
             "step_count": [10] * n,
             "score": np.clip(rng.random(n) + 0.2, 0, 1),
+            "truncated": [bool(i % 3 == 0) for i in range(n)],
         })
         s = summarize_split(df)
         ov = s["overall"]
@@ -279,6 +280,28 @@ class TestSummarizeSplit:
         assert "auc_gap_node_mc_minus_leaf_chain" in s["buckets"]["label_source"]
         assert s["mc_correlation"]["n"] == n // 2
         assert s["calibration_bins"][0]["bin"].startswith("[0.0")
+        # 截断与否分桶（U3）：两组齐备 + AUC 差 + 覆盖全部样本
+        tr = s["buckets"]["truncated"]
+        assert {"truncated", "not_truncated"} <= set(tr)
+        assert "auc_gap_truncated_minus_clean" in tr
+        assert tr["truncated"]["n"] + tr["not_truncated"]["n"] == n
+
+    def test_truncated_bucket_absent_without_column(self):
+        """df 无 truncated 列 → 空桶（兼容旧版 predictions.parquet）。"""
+        pytest.importorskip("torch")
+        from prm.eval_prm import bucket_block_truncated
+        assert bucket_block_truncated(pd.DataFrame({"label_binary": [0, 1],
+                                                    "score": [0.2, 0.8]})) == {}
+
+    def test_cap_candidates(self):
+        """§9.2「每实例 ≤k 条 root rollouts」：确定性取前 k；k<=0 不限制。"""
+        from prm.metrics import cap_candidates
+        rs = [{"rollout_idx": i, "reward": i} for i in [3, 0, 4, 1, 2, 6, 5]]
+        assert [r["rollout_idx"] for r in cap_candidates(rs, 5)] == [0, 1, 2, 3, 4]
+        assert len(cap_candidates(rs, 0)) == len(rs)      # 不限制
+        assert len(cap_candidates(rs, 99)) == len(rs)     # k > 总数
+        assert (cap_candidates(rs, 5)
+                == cap_candidates(list(reversed(rs)), 5))  # 与输入顺序无关
 
     def test_report_md_contains_blocks(self):
         pytest.importorskip("torch")

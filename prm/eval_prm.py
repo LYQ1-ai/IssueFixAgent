@@ -34,7 +34,9 @@ import pandas as pd
 import yaml
 
 from prm import metrics as M
-from prm.data import PrmParquetDataset, VerdictCollator, tensors_from
+from prm.env import describe as describe_env, load_project_env
+from prm.data import (PrmParquetDataset, VerdictCollator, collate_or_skip,
+                      tensors_from)
 from prm.modeling import VerdictScorer, resolve_verdict_ids
 from prm.prompts import template_hash
 
@@ -85,22 +87,29 @@ def load_scorer_for_run(run_dir: str, device: str = "cuda",
 # ---------------------------------------------------------------------------
 
 def evaluate_samples(scorer: VerdictScorer, collator: VerdictCollator, ds: PrmParquetDataset,
-                     device: str, batch_size: int = 8) -> pd.DataFrame:
+                     device: str, batch_size: int = 1) -> pd.DataFrame:
     """逐样本前向 → predictions DataFrame（含分桶字段）。"""
     import torch
     scores: list[float] = []
+    trunc_flags: list[bool] = []
     for i in range(0, len(ds), batch_size):
         items = [ds[j] for j in range(i, min(i + batch_size, len(ds)))]
-        batch = collator(items)
+        batch = collate_or_skip(collator, items)      # §7.2 预算不足 → 跳过该样本
+        if batch is None:
+            continue
         t = tensors_from(batch, device=device)
         with torch.no_grad():
             p = scorer.predict_proba(t["input_ids"], t["attention_mask"])
         scores.extend(p.float().cpu().tolist())
+        if "truncated" in t:
+            trunc_flags.extend(bool(v) for v in t["truncated"].cpu().tolist())
     keys = ("sample_id", "instance_id", "split", "label", "label_binary", "label_source",
             "mc_score", "rendered_tokens", "step_index", "step_count")
     rows = [{k: ds[j][k] for k in keys} for j in range(len(ds))]
     df = pd.DataFrame(rows)
     df["score"] = scores
+    if trunc_flags:
+        df["truncated"] = trunc_flags
     return df
 
 
@@ -136,6 +145,7 @@ def summarize_split(df: pd.DataFrame) -> dict:
         "label_source": source_buckets,
         "position_abs": bucket_block_abs(df),
         "context_length": bucket_block_len(df),
+        "truncated": bucket_block_truncated(df),
     }
     # MC 相关性（真实非 leaf 节点 = node_mc）
     sub = df[df["label_source"] == "node_mc"]
@@ -178,15 +188,38 @@ def bucket_block_len(df: pd.DataFrame) -> dict:
     return {g: M.bucket_metrics(y, p, [idx])[0] for g, idx in sorted(groups.items())}
 
 
+def bucket_block_truncated(df: pd.DataFrame) -> dict:
+    """「是否被 §7.2 截断」分桶（§9.2）。
+
+    回答一个关键问题：**被截断样本的打分质量是否显著更差**——用于区分"长上下文
+    本身难"与"截断把语义撕碎"（两者的对策相反：前者要更多长样本，后者要扩
+    max_length 或改截断策略）。
+    """
+    if "truncated" not in df.columns:
+        return {}
+    y = df["label_binary"].to_numpy(dtype=np.int64)
+    p = df["score"].to_numpy(dtype=np.float64)
+    out: dict[str, dict] = {}
+    for flag, name in ((False, "not_truncated"), (True, "truncated")):
+        idx = [i for i, v in enumerate(df["truncated"]) if bool(v) is flag]
+        if idx:
+            out[name] = M.bucket_metrics(y, p, [idx])[0]
+    if {"truncated", "not_truncated"} <= out.keys():
+        out["auc_gap_truncated_minus_clean"] = (
+            out["truncated"]["auc"] - out["not_truncated"]["auc"])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 轨迹级评估 + best-of-5（§9.2 块 5/6）
 # ---------------------------------------------------------------------------
 
 def trajectory_eval(scorer: VerdictScorer, collator: VerdictCollator, conn,
                     instance_ids: list[str], heads: dict[str, str], device: str,
-                    batch_size: int = 8, gamma: float = 0.95,
+                    batch_size: int = 1, gamma: float = 0.95,
                     max_instances: Optional[int] = None,
-                    max_steps_per_rollout: int = 32) -> tuple[pd.DataFrame, dict]:
+                    max_steps_per_rollout: int = 32,
+                    k_candidates: int = 5) -> tuple[pd.DataFrame, dict]:
     """root rollouts 逐步打分 → 聚合相关性 + best-of-5。
 
     返回 ``(traj_df, bestof_summary)``；``traj_df`` 每行 = 一条 root rollout 的聚合。
@@ -200,7 +233,8 @@ def trajectory_eval(scorer: VerdictScorer, collator: VerdictCollator, conn,
     jobs: list[tuple[str, int, int, list[dict]]] = []  # (iid, rollout_idx, step_i, messages)
     meta: dict[tuple[str, int], dict] = {}
     for iid in iids:
-        rollouts = load_root_rollouts(conn, iid)
+        # §9.2「每实例 ≤5 条 root rollouts」：按 rollout_idx 升序取前 k 条（确定性）
+        rollouts = M.cap_candidates(load_root_rollouts(conn, iid), k_candidates)
         if not rollouts:
             continue
         head_user = head_user_content(heads[iid]) if iid in heads else None
@@ -227,7 +261,12 @@ def trajectory_eval(scorer: VerdictScorer, collator: VerdictCollator, conn,
         if not batch:
             return
         items = [{"messages": m, "label": 0.0} for m in batch]
-        t = tensors_from(collator(items), device=device)
+        tensors = collate_or_skip(collator, items)    # §7.2 预算不足 → 整批丢弃并计数
+        if tensors is None:
+            batch.clear()
+            keys.clear()
+            return
+        t = tensors_from(tensors, device=device)
         with torch.no_grad():
             p = scorer.predict_proba(t["input_ids"], t["attention_mask"])
         for (iid, ri, _si), sc in zip(keys, p.float().cpu().tolist()):
@@ -272,8 +311,24 @@ def trajectory_eval(scorer: VerdictScorer, collator: VerdictCollator, conn,
     per_instance = []
     for iid, grp in traj_df.groupby("instance_id"):
         per_instance.append({"instance_id": iid, "rollouts": grp.to_dict("records")})
+    # 候选数分布（审计 §9.2「每实例 ≤k 条」是否满足；N 不等会影响 oracle/regret 基准）
+    cand_counts = [len(x["rollouts"]) for x in per_instance]
+    cand_hist: dict[str, int] = {}
+    for c in cand_counts:
+        cand_hist[str(c)] = cand_hist.get(str(c), 0) + 1
     bestof = M.best_of_metrics(per_instance, n_boot=1000) if per_instance else {}
-    return traj_df, {"correlations": corr, "best_of": bestof}
+    return traj_df, {
+        "correlations": corr,
+        "best_of": bestof,
+        "k_candidates": int(k_candidates),
+        "n_candidates": {
+            "n_instances": len(cand_counts),
+            "min": min(cand_counts) if cand_counts else 0,
+            "max": max(cand_counts) if cand_counts else 0,
+            "mean": float(sum(cand_counts) / len(cand_counts)) if cand_counts else 0.0,
+            "hist": dict(sorted(cand_hist.items(), key=lambda kv: int(kv[0]))),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -309,10 +364,28 @@ def report_md(report: dict) -> str:
         mc = s["mc_correlation"]
         lines += ["", f"### 与 MC 相关性（node_mc, n={mc['n']}）", "",
                   f"- Pearson {mc['pearson']:.4f} | Spearman {mc['spearman']:.4f}", ""]
+        tr = s["buckets"].get("truncated") or {}
+        if tr:
+            lines += ["### 截断与否分桶（§7.2 截断对打分质量的影响）", "",
+                      "| group | n | AUC | Brier |", "| --- | --- | --- | --- |"]
+            for name in ("not_truncated", "truncated"):
+                b = tr.get(name)
+                if b:
+                    lines.append(f"| {name} | {b['n']} | {b['auc']:.4f} | {b['brier']:.4f} |")
+            gap_t = tr.get("auc_gap_truncated_minus_clean")
+            if gap_t is not None:
+                lines += ["", f"- AUC 差（truncated − not_truncated）= {gap_t:.4f}"
+                              "（显著为负 ⇒ 截断样本质量更差，考虑扩 max_length 或改截断策略）"]
+            lines.append("")
     if report.get("trajectory"):
         bo = report["trajectory"]["best_of"]
-        lines += ["## 轨迹级 / best-of-5（test root rollouts）", "",
-                  "| selector | n | selected_reward | CI95(Δvs random) | selected_correct | regret | win_rate |",
+        nc = report["trajectory"].get("n_candidates") or {}
+        lines += ["## 轨迹级 / best-of-5（test root rollouts）", ""]
+        if nc:
+            lines += [f"- 候选数（每实例 ≤ k={report['trajectory'].get('k_candidates')}）："
+                      f"n_instances={nc['n_instances']} min={nc['min']} max={nc['max']} "
+                      f"mean={nc['mean']:.2f} | 分布 {nc['hist']}", ""]
+        lines += ["| selector | n | selected_reward | CI95(Δvs random) | selected_correct | regret | win_rate |",
                   "| --- | --- | --- | --- | --- | --- | --- |"]
         for sel, m in bo.items():
             ci = m.get("reward_diff_vs_random_ci95")
@@ -330,6 +403,7 @@ def report_md(report: dict) -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    load_project_env()          # 入口装载 .env（GPU/CUDA 选择），早于 torch/CUDA 初始化
     p = argparse.ArgumentParser(prog="python -m prm.eval_prm", description="PRM 评估（§9.2）")
     p.add_argument("--config", default="config/prm.yaml")
     p.add_argument("--run", required=True, help="run 名（outputs/prm/runs/<name>）")
@@ -346,11 +420,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     import torch
+    logger.info("GPU 选择: %s", describe_env())
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     data_dir = Path(cfg["output"]["dir"])
     run_dir = data_dir / "runs" / args.run
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    batch_size = args.batch_size or cfg.get("eval", {}).get("batch_size", 8)
+    batch_size = args.batch_size or cfg.get("eval", {}).get("batch_size", 1)
+    if batch_size != 1:
+        raise SystemExit(
+            f"batch_size 必须为 1（当前 {batch_size}）：Qwen3.5 混合架构对 pad 前缀敏感，"
+            "多样本批的 padding 会改变打分；依据见 docs/prm_training_plan.md §14.2")
 
     scorer, manifest, collator = load_scorer_for_run(str(run_dir), device=device,
                                                      attn_implementation=args.attn)
@@ -387,6 +466,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         traj_df, traj_summary = trajectory_eval(
             scorer, collator, conn, test_ids, heads, device, batch_size,
             gamma=cfg.get("eval", {}).get("best_of", {}).get("gamma", 0.95),
+            k_candidates=cfg.get("eval", {}).get("best_of", {}).get("k", 5),
             max_instances=args.traj_max_instances)
         report["trajectory"] = traj_summary
         if len(traj_df):

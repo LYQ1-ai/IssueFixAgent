@@ -350,6 +350,11 @@ class TestSafetyAndManifest:
         assert set(ls["percentiles"]) == {50, 75, 90, 95, 99}
         assert ls["approx"] is True  # 无 tokenizer → 近似并在报告标注
         assert "3.5 chars/token 近似" in (out / "length_report.md").read_text(encoding="utf-8")
+        # U6：人工抽检报告（§13.2 步骤 3 留档）
+        spot = out / "spot_check.md"
+        assert spot.exists()
+        txt = spot.read_text(encoding="utf-8")
+        assert "样本抽检报告" in txt and "核对要点" in txt and "```text" in txt
 
     def test_cli_overwrite_guard(self, env):
         """已存在输出且未加 --overwrite → SystemExit（不重建）。"""

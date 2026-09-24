@@ -21,7 +21,11 @@ pytest.importorskip("transformers")
 import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent))
-from prm_torch_fixtures import build_tiny_model, build_tiny_tokenizer  # noqa: E402
+from prm_torch_fixtures import (  # noqa: E402
+    build_tiny_model,
+    build_tiny_tokenizer,
+    make_tiny_messages,
+)
 
 from prm.modeling import (  # noqa: E402
     VerdictScorer,
@@ -108,23 +112,78 @@ class TestVerdictScorer:
         last = t["attention_mask"].sum(1) - 1
         manual = (out.logits[0, last[0], model.id_correct]
                   - out.logits[0, last[0], model.id_incorrect])
-        assert torch.equal(z, torch.stack([manual]))
+        # 快路径只对末位做 GEMM，累加顺序与全量 GEMM 不同 → 允许浮点误差
+        assert torch.allclose(z, torch.stack([manual]), atol=1e-5)
 
-    def test_padded_vs_unpadded_score_identical(self, scorer):
-        """逐条 vs 批量（含右 padding）分数一致（§7.1-3）。"""
+    def test_trailing_pad_fallback_picks_last_real_position(self, scorer):
+        """绕过 collator 手造带尾随 pad 的批 → 回退全量 logits 路径且取位正确。
+
+        生产路径已由 collator 强制单样本批（无 padding）；本测试只保证那条
+        **兜底分支**（`trailing_pad > 0`）的取位语义没写错——注意它只修正"取哪个
+        位置"，并不能消除 pad 本身对 Qwen3.5 混合层的污染（计划书 §14.2）。
+        """
         model, tok = scorer
-        from prm.data import VerdictCollator, tensors_from
+        from prm.data import VerdictCollator
         from prm_torch_fixtures import make_tiny_messages
         coll = VerdictCollator(tokenizer=tok, max_length=2048)
-        b1 = tensors_from(coll([{"messages": make_tiny_messages(1), "label": 1.0}]))
-        b2 = tensors_from(coll([{"messages": make_tiny_messages(3), "label": 1.0}]))
-        both = tensors_from(coll([{"messages": make_tiny_messages(1), "label": 1.0},
-                                  {"messages": make_tiny_messages(3), "label": 1.0}]))
-        z_single1 = model(b1["input_ids"], b1["attention_mask"])[0]
-        z_single3 = model(b2["input_ids"], b2["attention_mask"])[0]
-        z_batch = model(both["input_ids"], both["attention_mask"])
-        assert torch.allclose(z_batch[0], z_single1, atol=1e-5)
-        assert torch.allclose(z_batch[1], z_single3, atol=1e-5)
+        b1 = coll([{"messages": make_tiny_messages(1), "label": 1.0}])
+        z_single = model(b1["input_ids"], b1["attention_mask"])[0]
+
+        n1 = int(b1["attention_mask"].sum())
+        pad_id = tok.pad_token_id
+        n2 = n1 + 7
+        ids = torch.cat([b1["input_ids"][0], torch.full((7,), pad_id, dtype=torch.long)])[None]
+        mask = torch.cat([torch.ones(n1, dtype=torch.long),
+                          torch.zeros(7, dtype=torch.long)])[None]
+        assert model._logits_to_keep_kw == "logits_to_keep"   # 快路径存在但不应被用
+        z_pad = model(ids, mask)[0]
+        assert torch.allclose(z_pad, z_single, atol=1e-5)
+
+    def test_forward_uses_logits_to_keep(self, scorer):
+        """只算末位 logits（全量 (B,L,V) 在 16K×248K 词表下 ≈65GB，必 OOM）。"""
+        model, tok = scorer
+        calls: dict = {}
+        real_forward = model.backbone.forward
+
+        def spy(*args, **kwargs):
+            calls.update(kwargs)
+            return real_forward(*args, **kwargs)
+
+        model.backbone.forward = spy
+        try:
+            t = _batch(model, tok, 2)
+            z = model(t["input_ids"], t["attention_mask"])
+        finally:
+            model.backbone.forward = real_forward
+        assert calls.get("logits_to_keep") == 1, "快路径未启用（会 OOM）"
+        assert "position_ids" in calls, "左 padding 下必须显式给位置编码"
+        assert z.shape == (1,)
+
+    def test_fallback_when_logits_to_keep_unsupported(self, scorer):
+        """backbone 不支持该参数时回退全量 logits，结果与快路径一致。"""
+        model, tok = scorer
+        t = _batch(model, tok, 2)
+        z_fast = model(t["input_ids"], t["attention_mask"])
+        model._logits_to_keep_kw = None          # 强制走回退路径
+        z_fallback = model(t["input_ids"], t["attention_mask"])
+        assert torch.allclose(z_fast, z_fallback, atol=1e-5)
+
+    def test_detect_logits_to_keep_kwarg(self, scorer):
+        from prm.modeling import _detect_logits_to_keep_kwarg
+        model, _ = scorer
+        assert _detect_logits_to_keep_kwarg(model.backbone) == "logits_to_keep"
+
+        class _Old(torch.nn.Module):
+            def forward(self, input_ids, attention_mask, num_logits_to_keep=0):
+                return None
+
+        assert _detect_logits_to_keep_kwarg(_Old()) == "num_logits_to_keep"
+
+        class _Bare(torch.nn.Module):
+            def forward(self, input_ids):
+                return None
+
+        assert _detect_logits_to_keep_kwarg(_Bare()) is None
 
     def test_predict_proba_sigmoid(self, scorer):
         model, tok = scorer
@@ -229,16 +288,14 @@ class TestRealModelGpu:
         assert next(scorer.parameters()).device.type == "cuda"
 
         # 真 tokenizer 渲染（F3：nothink 生成提示含空 think 块）→ collator → 前向
+        # 单样本批（bs=1 强制；多样本会产生 padding，见计划书 §14.2）
         from prm.data import VerdictCollator
         collator = VerdictCollator(tokenizer=tok, max_length=4096)
-        batch = collator([
-            {"messages": make_tiny_messages(2), "label": 1.0},
-            {"messages": make_tiny_messages(1), "label": 0.0},
-        ])
+        batch = collator([{"messages": make_tiny_messages(2), "label": 1.0}])
         with torch.no_grad():
             z = scorer(batch["input_ids"].to("cuda"),
                        batch["attention_mask"].to("cuda"))
-        assert z.shape == (2,)
+        assert z.shape == (1,)
         assert torch.isfinite(z).all()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA GPU")
@@ -247,9 +304,38 @@ class TestRealModelGpu:
         scorer, tok = self._load_scorer_on_gpu()
         from prm.data import VerdictCollator
         collator = VerdictCollator(tokenizer=tok, max_length=4096)
-        batch = collator([{"messages": make_tiny_messages(n), "label": 1.0}
-                          for n in (1, 2, 3)])
+        zs = []
+        for n in (1, 2, 3):   # 逐条前向（bs=1，无 padding）
+            b = collator([{"messages": make_tiny_messages(n), "label": 1.0}])
+            with torch.no_grad():
+                zs.append(float(scorer(b["input_ids"].to("cuda"),
+                                       b["attention_mask"].to("cuda"))[0]))
+        assert len(set(zs)) > 1, f"不同前缀给出相同 z={zs}（打分退化）"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA GPU")
+    def test_real_model_right_padding_gather_is_exact(self):
+        """真实架构护栏：手造**右** padding 批 + 逐行取位 ≈ 单条评分。
+
+        实测基准（2026-09-11，CPU 参考实现）：右 padding 在 1/8 pad 时 Δz=0.0000、
+        46 pad 时 Δz=0.125；而**左** padding 的 Δz 可达 1.22（Δp 0.26~0.70）。
+        阈值 0.26 足以拦住左 padding / 批大小放开导致的回归，同时容忍 bf16 与
+        分块内核的数值抖动。tiny Llama 测不出这类问题（无卷积/线性注意力层）。
+        """
+        scorer, tok = self._load_scorer_on_gpu()
+        from prm.data import VerdictCollator
+        coll = VerdictCollator(tokenizer=tok, max_length=4096)
+        b = coll([{"messages": make_tiny_messages(1), "label": 1.0}])
         with torch.no_grad():
-            z = scorer(batch["input_ids"].to("cuda"),
-                       batch["attention_mask"].to("cuda"))
-        assert float(z.float().std()) > 0
+            z_alone = float(scorer(b["input_ids"].to("cuda"),
+                                   b["attention_mask"].to("cuda"))[0])
+        n = int(b["attention_mask"].sum())
+        pad = tok.pad_token_id
+        ids = torch.cat([b["input_ids"][0],
+                         torch.full((16,), pad, dtype=torch.long)])[None].to("cuda")
+        mask = torch.cat([torch.ones(n, dtype=torch.long),
+                          torch.zeros(16, dtype=torch.long)])[None].to("cuda")
+        with torch.no_grad():
+            z_pad = float(scorer(ids, mask)[0])   # trailing_pad>0 → 回退全量+gather
+        assert abs(z_pad - z_alone) < 0.26, (
+            f"右 padding 取位不精确：z_pad={z_pad} vs z_alone={z_alone}"
+            "（若改回左 padding，此处会显著失败——见计划书 §14.2）")

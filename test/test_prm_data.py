@@ -3,7 +3,7 @@
 """prm/data.py 单测（docs/prm_training_plan.md §10 test_prm_data 行）。
 
 覆盖：截断顺序（保上下文/指令、整步删除较早步保被判定步、marker）、
-tool content 尾部截断（保 returncode+前 N token）、右 padding 逐条 vs 批量
+tool content 尾部截断（保 returncode+前 N token）、左 padding 逐条 vs 批量
 token 序列一致、collator 张量形状、预算下限报错、截断统计。
 需 torch/transformers（离线 tiny tokenizer，见 test/prm_torch_fixtures.py）。
 """
@@ -77,33 +77,37 @@ class TestNoTruncation:
         out = c.truncate_messages(msgs)
         assert out is msgs or out == msgs  # 未截断，原样返回
 
-    def test_batch_shapes_and_right_padding(self, tok):
+    def test_single_sample_batch_no_padding(self, tok):
+        """单样本批（唯一允许的形式）：无 padding，张量形状/标签正确。"""
         c = _make_collator(tok, 4096)
-        batch = [{"messages": make_tiny_messages(1), "label": 0.8},
-                 {"messages": make_tiny_messages(3), "label": 0.2}]
-        out = c(batch)
-        n1 = len(c._encode(batch[0]["messages"]))
-        n3 = len(c._encode(batch[1]["messages"]))
-        assert n3 > n1
-        assert out["attention_mask"][0].tolist() == [1] * n1 + [0] * (n3 - n1)  # 短行右侧补 0
-        assert out["attention_mask"][1].tolist() == [1] * n3
-        assert len(set(out["input_ids"][0][n1:].tolist())) == 1  # pad token 恒定
-        assert out["labels"].tolist() == pytest.approx([0.8, 0.2])
+        item = {"messages": make_tiny_messages(3), "label": 0.2}
+        out = c([item])
+        n = len(c._encode(item["messages"]))
+        assert out["input_ids"].shape == (1, n)
+        assert out["attention_mask"].tolist() == [[1] * n]      # 无任何 pad
+        assert out["labels"].tolist() == pytest.approx([0.2])
+
+    def test_multi_sample_batch_rejected(self, tok):
+        """多样本批必须报错（Qwen3.5 混合层对 pad 前缀敏感，见计划书 §14.2）。"""
+        c = _make_collator(tok, 4096)
+        with pytest.raises(ValueError, match="只接受单样本批"):
+            c([{"messages": make_tiny_messages(1), "label": 0.8},
+               {"messages": make_tiny_messages(3), "label": 0.2}])
 
     def test_single_vs_batch_token_ids_identical(self, tok):
-        """逐条 vs 批量（含 padding）token 序列一致（§7.1-3 的前提）。"""
+        """单样本批的 token 序列与直接编码一致（§7.1-3 的前提）。"""
         c = _make_collator(tok, 4096)
         msgs = make_tiny_messages(2)
         single = c._encode(c.truncate_messages(msgs))
         batched = c([{"messages": msgs, "label": 1.0}])
-        assert batched["input_ids"][0][:len(single)].tolist() == list(single)
-        assert all(v == 0 for v in batched["attention_mask"][0][len(single):].tolist())
+        assert batched["input_ids"][0].tolist() == list(single)
+        assert batched["attention_mask"][0].tolist() == [1] * len(single)
 
     def test_stats_counters(self, tok):
         c = _make_collator(tok, 4096)
-        c([{"messages": make_tiny_messages(1), "label": 1.0},
-           {"messages": make_tiny_messages(2), "label": 0.0}])
-        assert c.stats["n_batches"] == 1 and c.stats["n_samples"] == 2
+        c([{"messages": make_tiny_messages(1), "label": 1.0}])
+        c([{"messages": make_tiny_messages(2), "label": 0.0}])
+        assert c.stats["n_batches"] == 2 and c.stats["n_samples"] == 2
         assert c.stats["n_truncated"] == 0
 
 
@@ -183,6 +187,86 @@ class TestTruncation:
         out = c.truncate_messages(msgs)
         assert any(m.get("reasoning_content") == "step 1 reasoning" for m in out)
         assert c.stats["steps_dropped"] == 0
+
+
+# ---------------------------------------------------------------------------
+# §7.2 边界样本：被判定步本身超预算 → 预检/跳过（2026-09-15 真机训练崩过）
+# ---------------------------------------------------------------------------
+
+def _unfittable_messages(n_words: int = 800) -> list[dict]:
+    """末步 assistant 内容巨大且 tool 截断动不了它 → 任何 max_length 都放不下。"""
+    msgs = make_tiny_messages(1)
+    next(m for m in msgs if m["role"] == "assistant")["content"] = make_long_output(n_words)
+    return msgs
+
+
+class TestOversizeSkip:
+    def test_fits_flags_unfittable_without_touching_stats(self, tok):
+        c = _make_collator(tok, 700)
+        before = dict(c.stats)
+        assert c.fits(_unfittable_messages()) is False
+        assert c.stats == before                      # 预检不污染截断统计
+        assert c.fits(make_tiny_messages(1)) is True
+        assert c.stats == before
+
+    def test_oversize_indices_only_scans_candidates_and_caches(self, tok, tmp_path):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from prm.build_dataset import SCHEMA, messages_to_arrow
+        from prm.data import PrmParquetDataset, oversize_indices
+
+        def row(sid: str, msgs: list[dict], n_tok: int) -> dict:
+            return {
+                "sample_id": sid, "instance_id": "i", "repo": "r", "split": "train",
+                "node_key": "n", "step_index": 1, "step_count": 1,
+                "messages": messages_to_arrow(msgs), "label": 1.0, "label_binary": 1,
+                "label_soft": 1.0, "label_source": "node_mc", "mc_score": 1.0,
+                "n_rollouts": 5, "visits": 1, "in_pool": 1, "rendered_tokens": n_tok,
+            }
+
+        rows = [row("ok1", make_tiny_messages(1), 10),          # ≤ max_length → 快路径
+                row("bad1", _unfittable_messages(), 99999),     # 候选 → 真扫 → 命中
+                row("ok2", make_tiny_messages(2), 10)]
+        path = tmp_path / "d.parquet"
+        pq.write_table(pa.table({f.name: pa.array([r[f.name] for r in rows], type=f.type)
+                                 for f in SCHEMA}, schema=SCHEMA), path)
+        ds = PrmParquetDataset(str(path))
+        cache = tmp_path / "oversize_skip_train.json"
+
+        c = _make_collator(tok, 700)
+        assert oversize_indices(ds, c, cache_path=str(cache)) == [1]
+        assert c.stats["skipped_oversize"] == 1
+        assert json.loads(cache.read_text(encoding="utf-8"))["sample_ids"] == ["bad1"]
+
+        c2 = _make_collator(tok, 700)                  # 第二次：指纹命中，直接复用
+        assert oversize_indices(ds, c2, cache_path=str(cache)) == [1]
+        assert c2.stats["skipped_oversize"] == 1
+
+    def test_collate_or_skip_counts_instead_of_raising(self, tok):
+        from prm.data import collate_or_skip
+
+        c = _make_collator(tok, 700)
+        assert collate_or_skip(c, [{"messages": _unfittable_messages(), "label": 1.0,
+                                    "sample_id": "bad1"}]) is None
+        assert c.stats["skipped_oversize"] == 1
+        ok = collate_or_skip(c, [{"messages": make_tiny_messages(1), "label": 1.0,
+                                  "sample_id": "ok1"}])
+        assert ok is not None and ok["input_ids"].shape[0] == 1
+
+    def test_filter_oversize_items_keeps_alignment(self, tok):
+        from prm.data import filter_oversize_items
+
+        c = _make_collator(tok, 700)
+        items = [{"messages": make_tiny_messages(1), "label_binary": 1, "sample_id": "a",
+                  "rendered_tokens": 10},
+                 {"messages": _unfittable_messages(), "label_binary": 0, "sample_id": "b",
+                  "rendered_tokens": 99999},
+                 {"messages": make_tiny_messages(2), "label_binary": 1, "sample_id": "c",
+                  "rendered_tokens": 10}]
+        kept, dropped = filter_oversize_items(c, items)
+        assert [it["sample_id"] for it in kept] == ["a", "c"]   # 顺序/标签对齐保持
+        assert dropped == ["b"]
+        assert c.stats["skipped_oversize"] == 1
 
 
 # ---------------------------------------------------------------------------

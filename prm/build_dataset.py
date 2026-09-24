@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import time
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
@@ -43,6 +44,7 @@ from mcts.steps import prefix_node_key
 
 from prm import labeling, raw
 from prm.preprocess import TrajectoryPreprocessor
+from prm.env import load_project_env
 from prm.prompts import TEMPLATE_VERSION, template_hash
 
 logger = logging.getLogger("prm.build")
@@ -684,8 +686,71 @@ class PRMDatasetBuilder:
             self.build_report_md(manifest), encoding="utf-8")
         (self.out_dir / "length_report.md").write_text(
             self.length_report_md(manifest["length_stats"]), encoding="utf-8")
-        logger.info("构建完成: %s（manifest/build_report/length_report 已写出）", self.out_dir)
+        spot = write_spot_check(self.out_dir, n=int(self.cfg["build"].get("spot_check_n", 20)))
+        logger.info("构建完成: %s（manifest/build_report/length_report/%s 已写出）",
+                    self.out_dir, spot.name)
         return manifest
+
+
+def write_spot_check(out_dir: Path, n: int = 20, seed: int = 0) -> Path:
+    """生成 `spot_check.md`：人工抽检报告（§13.2 步骤 3 的留档）。
+
+    从构建产物里按**确定性**方式（split 分层 + 固定 seed 洗牌）抽 ``n`` 条样本，
+    渲染出 PRM 实际会看到的 prompt 文本（system / issue 上下文 / 逐步轨迹 / 末轮
+    指令）+ 标签来源与数值，供人眼核对：
+
+    1. issue 是否**原文**进入 prompt、有没有 gold 泄漏（patch / 目标位置）；
+    2. 轨迹的 assistant 动作（tool_calls 命令）与 tool observation 是否齐全；
+    3. label / label_source / step_index 是否与被判定步一致（leaf 链回填的末步应为 0）。
+
+    这是单测覆盖不到的一环（单测只能断言结构，看不出"渲染是否合理"）。
+    """
+    import pyarrow.parquet as pq
+
+    rng = random.Random(seed)
+    rows: list[dict] = []
+    per_split = max(1, (n + 2) // 3)          # 向上取整后均分到 3 个 split
+    for name in ("train", "dev", "test"):
+        path = Path(out_dir) / f"{name}.parquet"
+        if not path.exists():
+            continue
+        tbl = pq.read_table(path).to_pylist()
+        if not tbl:
+            continue
+        rng.shuffle(tbl)
+        rows.extend(tbl[:per_split])
+    rows = rows[:n]
+
+    lines = [
+        "# PRM 样本抽检报告（`prm/build_dataset.py::write_spot_check`）", "",
+        f"- 抽样 {len(rows)} 条（split 分层，seed={seed}）；字段与渲染口径见 §4/§5.4",
+        "- 核对要点：① issue 原文且无 gold；② 动作/观察齐全；③ 标签与被判定步一致", "",
+    ]
+    for i, r in enumerate(rows, 1):
+        lines += [
+            f"## {i}. `{r['sample_id']}`", "",
+            f"- split={r['split']} | label={r['label']:.4f}"
+            f" | binary={r['label_binary']} | soft={r['label_soft']:.4f}"
+            f" | source={r['label_source']}",
+            f"- step_index={r['step_index']}/{r['step_count']}"
+            f" | mc={r['mc_score']} | n_rollouts={r['n_rollouts']}"
+            f" | rendered_tokens={r['rendered_tokens']}",
+            "",
+        ]
+        for m in r["messages"]:
+            role = m.get("role")
+            body = m.get("content") or ""
+            extra = ""
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                extra += f"\n    [tool_call] {fn.get('name')}({fn.get('arguments')})"
+            if m.get("reasoning_content"):
+                extra += f"\n    [reasoning] {str(m['reasoning_content'])[:200]}"
+            lines += [f"- **{role}**{extra}", "", "  ```text",
+                      "  " + str(body)[:2000].replace("\n", "\n  "), "  ```", ""]
+    path = Path(out_dir) / "spot_check.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +775,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--class-weight-cap", type=float, default=None, help="w_neg 上限")
     p.add_argument("--workers", type=int, default=None, help="并行进程数")
     p.add_argument("--overwrite", action="store_true", default=None, help="覆盖已存在的输出")
+    p.add_argument("--spot-check-only", action="store_true",
+                   help="只从已有 parquet 生成 spot_check.md（不重建数据）")
+    p.add_argument("--spot-check-n", type=int, default=20, help="抽检条数（默认 20）")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
@@ -737,11 +805,17 @@ def load_config(args: argparse.Namespace) -> dict:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    load_project_env()          # 入口装载 .env（GPU/CUDA 选择），早于 torch/CUDA 初始化
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     cfg = load_config(args)
     out_dir = Path(cfg["output"]["dir"])
+    if args.spot_check_only:
+        # 仅从已有 parquet 生成人工抽检报告（不重建数据；§13.2 步骤 3 留档）
+        path = write_spot_check(out_dir, n=int(args.spot_check_n))
+        print(f"抽检报告已生成: {path}")
+        return 0
     if not cfg["build"].get("overwrite", False):
         existing = [p for p in (f"{s}.parquet" for s in SPLITS) if (out_dir / p).exists()]
         if existing:

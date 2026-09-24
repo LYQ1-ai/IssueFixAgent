@@ -4,7 +4,8 @@
 
 - :class:`PrmParquetDataset`：构建产物 parquet → ``{messages, label, ...}`` 样本
   （``arguments`` JSON 字符串就地还原为 dict——chat template 渲染要求 mapping）；
-- :class:`VerdictCollator`：**训练/评估期动态截断** + 右 padding 张量化。
+- :class:`VerdictCollator`：**训练/评估期动态截断** + 张量化（**强制单样本批**，
+  不产生 padding；右 padding 仅为 API 兼容保留）。
   截断顺序（§7.2）：
 
   1. 保 system+user 上下文（预算不足报错）；
@@ -21,12 +22,13 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Optional
 
 import pyarrow.parquet as pq
 
 from prm.preprocess import CHAT_TEMPLATE_KWARGS, TrajectoryPreprocessor
-from prm.prompts import TRUNCATION_MARKER
+from prm.prompts import TRUNCATION_MARKER, template_hash
 
 logger = logging.getLogger("prm.data")
 
@@ -94,7 +96,10 @@ class PrmParquetDataset:
 
 
 class VerdictCollator:
-    """批量 collator：逐样本截断到 max_length → chat template tokenize → 右 padding。
+    """collator：逐样本截断到 max_length → chat template tokenize → 张量化。
+
+    **只接受单样本批**（``len(batch) == 1``）：Qwen3.5 混合架构对 pad 前缀敏感，
+    多样本批的 padding 会让打分失真（见 :meth:`__call__` 与计划书 §14.2）。
 
     Args:
         tokenizer_path: HF tokenizer 目录（PRM 基座）。
@@ -123,7 +128,10 @@ class VerdictCollator:
         self.tool_keep_tokens = int(tool_keep_tokens)
         # 截断统计（§7.2：写入 trainer_state）
         self.stats = {"n_batches": 0, "n_samples": 0, "n_truncated": 0,
-                      "steps_dropped": 0, "tools_truncated": 0, "errors": 0}
+                      "steps_dropped": 0, "tools_truncated": 0, "errors": 0,
+                      # §7.2 边界样本：被判定步本身超预算 → 该样本在给定 max_length
+                      # 下不可用，只能跳过（跳过的计入此处，不再抛错杀训练）
+                      "skipped_oversize": 0}
 
     # ------------------------------------------------------------------
     # 截断（§7.2）
@@ -169,6 +177,24 @@ class VerdictCollator:
                 f"截断后仍超限（{final_len} > {self.max_length}）："
                 f"issue/末步过长，检查样本（§7.2 禁止截断 issue/指令）")
         return out
+
+    def fits(self, messages: list[dict]) -> bool:
+        """该样本能否截断进 ``max_length``（§7.2 边界样本预检）。
+
+        不改变 ``stats``（预扫不该污染截断计数）。抽出来是为了**在开训前**把
+        "被判定步本身就超预算"的样本挑掉——这类样本在 collator 里抛错，而 collator
+        跑在 DataLoader worker 内，异常会直接杀掉整个训练（2026-09-15 实测：
+        19,862 条里仅 1 条 → step 1146 崩，白跑 10 h）。
+        """
+        snapshot = dict(self.stats)
+        try:
+            self.truncate_messages(messages)
+            return True
+        except RuntimeError:
+            return False
+        finally:
+            self.stats.clear()
+            self.stats.update(snapshot)
 
     def _split(self, messages: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
         """→ (context=[system,user], trajectory=中间段, instruction=末条 user)。"""
@@ -266,17 +292,33 @@ class VerdictCollator:
         return list(out)
 
     def __call__(self, batch: list[dict]) -> dict:
-        """``[{"messages": [...], "label": float}, ...]`` → 训练张量批（右 padding）。
+        """``[{"messages": [...], "label": float}, ...]`` → 训练张量（**强制单样本批**）。
 
         直接产出 torch 张量（HF Trainer 的 data_collator 约定）；离线无 torch
         环境的单测经 ``tensors_from`` / 列表访问另行处理。
+
+        **为什么强制 len(batch)==1**：Qwen3.5 是混合架构（`causal_conv1d` +
+        gated delta rule 线性注意力），其顺序递推**对 pad 前缀敏感**——真机实测
+        （2026-09-11，`docs/prm_training_plan.md` §14.2）左 padding 会让 σ(z)
+        偏移最多 +0.70 且随 pad 数剧烈跳变；右 padding 也有 0.02 量级偏差。
+        单样本批不产生任何 padding（``pad = max_len - len(s) = 0``），与逐条
+        推理完全一致，故唯一安全的批大小是 1。
         """
         import torch  # 惰性（CodeAgentRL 环境无 torch）
+
+        if len(batch) != 1:
+            raise ValueError(
+                f"VerdictCollator 只接受单样本批（收到 {len(batch)} 条）——Qwen3.5 混合"
+                "架构对 pad 前缀敏感（左 padding 实测 Δp 最多 +0.70），多样本批会引入 "
+                "padding 使打分失真。请把 batch_size 设为 1；依据见 "
+                "docs/prm_training_plan.md §14.2。"
+            )
 
         self.stats["n_batches"] += 1
         self.stats["n_samples"] += len(batch)
         seqs: list[list[int]] = []
         labels: list[float] = []
+        trunc_flags: list[bool] = []
         for item in batch:
             messages = item["messages"]
             try:
@@ -284,6 +326,8 @@ class VerdictCollator:
             except RuntimeError:
                 self.stats["errors"] += 1
                 raise
+            # 逐样本截断标记（§9.2「truncated 与否」分桶用；总量统计在 stats）
+            trunc_flags.append(truncated is not messages and truncated != messages)
             if len(truncated) != len(messages):
                 self.stats["n_truncated"] += 1
             seqs.append(self._encode(truncated))
@@ -296,13 +340,16 @@ class VerdictCollator:
         input_ids, attention_mask = [], []
         for s in seqs:
             pad = max_len - len(s)
-            # padding 全局右侧（§7.1-3）：attention-mask 取 last non-pad 语义依赖
+            # 右 padding（与计划书 §7.1-3 一致）。bs=1 时 pad 恒为 0，此分支仅为
+            # API 兼容保留；万一将来放开批大小，必须同时解决混合层的 pad 敏感问题
+            # （per-row gather 只保证「取对位置」，不能消除 pad 前缀对递推的污染）。
             input_ids.append(s + [pad_id] * pad)
             attention_mask.append([1] * len(s) + [0] * pad)
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.float32),
+            "truncated": torch.tensor(trunc_flags, dtype=torch.bool),
         }
 
 
@@ -315,17 +362,125 @@ def tensors_from(batch: dict, device: Optional[str] = None):
         t = t.to(dtype)
         return t.to(device) if device else t
 
-    return {
+    out = {
         "input_ids": _t(batch["input_ids"], torch.long),
         "attention_mask": _t(batch["attention_mask"], torch.long),
         "labels": _t(batch["labels"], torch.float),
     }
+    if "truncated" in batch:            # 逐样本截断标记（§9.2 分桶用）
+        out["truncated"] = _t(batch["truncated"], torch.bool)
+    return out
+
+
+_OVERSIZE_CACHE_VERSION = 1
+
+
+def oversize_fingerprint(dataset, collator: VerdictCollator) -> dict:
+    """缓存指纹：parquet 身份 + 渲染/截断口径（任一变化则缓存作废）。"""
+    st = Path(dataset.path).stat()
+    return {"version": _OVERSIZE_CACHE_VERSION,
+            "max_length": int(collator.max_length),
+            "tool_keep_tokens": int(collator.tool_keep_tokens),
+            "template_hash": template_hash(),
+            "parquet_size": int(st.st_size),
+            "parquet_mtime": int(st.st_mtime)}
+
+
+def oversize_indices(dataset, collator: VerdictCollator,
+                     cache_path: Optional[str] = None) -> list[int]:
+    """扫出 **截断后仍放不下** 的样本下标（§7.2 边界样本），供训练/评估跳过。
+
+    - 只检查 ``rendered_tokens > max_length`` 的候选（构建期长度与训练期同口径，
+      其余必然能放下），所以对 2 万条训练集只有几百条需要真正走一遍策略；
+    - ``cache_path`` 命中指纹时直接复用：全量扫要几分钟，每次开训重扫不划算；
+    - 返回下标（升序），并把条数累加进 ``collator.stats["skipped_oversize"]``。
+    """
+    fp = oversize_fingerprint(dataset, collator)
+    if cache_path:
+        cp = Path(cache_path)
+        if cp.exists():
+            try:
+                cached = json.loads(cp.read_text(encoding="utf-8"))
+                if cached.get("fingerprint") == fp:
+                    idx = [int(i) for i in cached.get("indices", [])]
+                    logger.info("oversize 缓存命中 %s：跳过 %d 条（max_length=%d）",
+                                cp.name, len(idx), collator.max_length)
+                    collator.stats["skipped_oversize"] += len(idx)
+                    return idx
+            except (OSError, ValueError, KeyError) as e:
+                logger.warning("oversize 缓存不可用（%s）→ 重扫", e)
+
+    out: list[int] = []
+    n_cand = 0
+    for i in range(len(dataset)):
+        row = dataset[i]
+        n_tok = int(row.get("rendered_tokens") or 0)
+        if 0 < n_tok <= collator.max_length:
+            continue
+        n_cand += 1
+        if not collator.fits(row["messages"]):
+            out.append(i)
+    if out:
+        logger.warning("oversize 扫描：候选 %d 条，其中 **%d 条**无法截断进 max_length=%d → "
+                       "跳过（该样本被判定步本身超预算，§7.2）：%s",
+                       n_cand, len(out), collator.max_length,
+                       [dataset[i]["sample_id"] for i in out[:5]])
+    else:
+        logger.info("oversize 扫描：候选 %d 条，全部可截断 ✅", n_cand)
+    collator.stats["skipped_oversize"] += len(out)
+    if cache_path:
+        cp = Path(cache_path)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        cp.write_text(json.dumps(
+            {"fingerprint": fp, "indices": out,
+             "sample_ids": [dataset[i]["sample_id"] for i in out]},
+            ensure_ascii=False, indent=2), encoding="utf-8")
+    return out
+
+
+def filter_oversize_items(collator: VerdictCollator,
+                          items: list[dict]) -> tuple[list[dict], list[str]]:
+    """从**样本列表**里剔除 §7.2 预算不足的样本（保持原顺序）。
+
+    用于抽样评估（``probe``）：那里分数数组与标签按下标对齐，不能"中途跳过"，
+    只能先把不可用样本摘掉。返回 ``(保留的 items, 被剔除的 sample_id 列表)``。
+    """
+    kept, dropped = [], []
+    for it in items:
+        n_tok = int(it.get("rendered_tokens") or 0)
+        if 0 < n_tok <= collator.max_length or collator.fits(it["messages"]):
+            kept.append(it)
+        else:
+            dropped.append(it.get("sample_id", "?"))
+    if dropped:
+        logger.warning("剔除 %d 条无法截断的样本（§7.2 预算不足）：%s",
+                       len(dropped), dropped[:5])
+        collator.stats["skipped_oversize"] += len(dropped)
+    return kept, dropped
+
+
+def collate_or_skip(collator: VerdictCollator, items: list[dict]) -> Optional[dict]:
+    """``collator(items)``；预算不足（§7.2 边界样本）→ 计数并返回 ``None``。
+
+    评估路径（``eval_prm`` 的逐条前向 / best-of-k 聚合、``probe`` 抽样）用它包一层：
+    遇到"被判定步本身就超预算"的样本就跳过，而不是中断整轮评估。
+    """
+    try:
+        return collator(items)
+    except RuntimeError as e:
+        collator.stats["skipped_oversize"] += 1
+        sid = items[0].get("sample_id") if items else "?"
+        logger.warning("跳过无法截断的样本 %s：%s", sid, e)
+        return None
 
 
 __all__ = [
     "PrmParquetDataset",
     "VerdictCollator",
+    "collate_or_skip",
+    "filter_oversize_items",
     "load_messages",
+    "oversize_indices",
     "tensors_from",
     "TOOL_KEEP_TOKENS",
 ]

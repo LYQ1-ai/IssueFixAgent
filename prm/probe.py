@@ -9,7 +9,8 @@
 方向可 Hijack；≈0.5 时换 ``Yes/No``、``对/错`` token 对复测（§12）。一次前向
 同时支持多 token 对（同一 last-position logits 上取不同两 token 差，边际成本低）。
 
-GPU 要求：A800（GPU1）；运行前 ``nvidia-smi`` 确认显存空闲，若被占用先询问
+GPU 要求：A800；**用哪张卡由仓库根 ``.env`` 的 ``CUDA_VISIBLE_DEVICES`` 决定**
+（进程内 ``cuda:0`` 即选中卡，故 ``--device`` 默认不必传）；运行前 ``nvidia-smi`` 确认显存空闲，若被占用先询问
 用户，不自动停任何服务（§1.2）。
 """
 
@@ -25,7 +26,9 @@ from typing import Optional
 import numpy as np
 import yaml
 
-from prm.data import PrmParquetDataset, VerdictCollator, tensors_from
+from prm.env import describe as describe_env, load_project_env
+from prm.data import (PrmParquetDataset, VerdictCollator, filter_oversize_items,
+                      tensors_from)
 from prm.metrics import brier_score, classification_metrics, log_loss, roc_auc
 from prm.modeling import VerdictScorer, resolve_verdict_ids
 from prm.prompts import template_hash
@@ -63,7 +66,7 @@ def score_dataset(scorer: VerdictScorer, collator: VerdictCollator, items: list[
 
 def probe(model_path: str, dev_parquet: str, out_dir: str, *, n_samples: int = 500,
           seed: int = 42, pairs: Optional[list[tuple[str, str]]] = None,
-          batch_size: int = 8, max_length: int = 16384,
+          batch_size: int = 1, max_length: int = 16384,
           device: str = "cuda", attn_implementation: str = "sdpa",
           config: Optional[dict] = None) -> dict:
     """跑 M4.0 侦察并写报告，返回报告 dict。"""
@@ -79,14 +82,16 @@ def probe(model_path: str, dev_parquet: str, out_dir: str, *, n_samples: int = 5
     items = [ds[int(i)] for i in sorted(idx)]
     logger.info("probe: dev 抽样 %d/%d 条 → %s", len(items), len(ds), out)
 
-    tok = VerdictCollator(tokenizer_path=model_path, max_length=max_length).tokenizer
+    collator = VerdictCollator(tokenizer_path=model_path, max_length=max_length)
+    # §7.2 边界样本先摘掉：probe 的分数数组按下标与标签对齐，不能中途跳过
+    items, _dropped = filter_oversize_items(collator, items)
+    tok = collator.tokenizer
     scorer = VerdictScorer.from_pretrained(
         model_path, (0, 1), torch_dtype=torch.bfloat16,
         attn_implementation=attn_implementation).to(device)
     scorer.eval()
     pair_ids = {p: resolve_verdict_ids(tok, p) for p in pairs}
 
-    collator = VerdictCollator(tokenizer_path=model_path, max_length=max_length)
     y_true = np.array([it["label_binary"] for it in items], dtype=np.int64)
 
     results = {}
@@ -155,6 +160,7 @@ def probe_report_md(report: dict) -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    load_project_env()          # 入口装载 .env（GPU/CUDA 选择），早于 torch/CUDA 初始化
     p = argparse.ArgumentParser(prog="python -m prm.probe",
                                 description="M4.0 零训练侦察（§9.1）")
     p.add_argument("--config", default="config/prm.yaml")
@@ -167,12 +173,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--verdict-pairs", nargs="*", default=None,
                    help="token 对列表，如 'Correct,Incorrect' 'Yes,No' '对,错'"
                         "（缺省 = 三对全测）")
-    p.add_argument("--device", default=None, help="cuda / cuda:1 / cpu")
+    p.add_argument("--device", default=None,
+                   help="默认 cuda（= .env 选中的卡）；cpu 可强制走 CPU")
     p.add_argument("--attn", default=None, help="flash_attention_2 / sdpa（缺省 sdpa）")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logger.info("GPU 选择: %s", describe_env())
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     train_cfg = cfg.get("train", {})
     eval_cfg = cfg.get("eval", {})
@@ -180,12 +188,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     dev = args.dev or str(Path(cfg["output"]["dir"]) / "dev.parquet")
     out = args.out or cfg["output"]["dir"]
     device = args.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
+    if args.batch_size and args.batch_size != 1:
+        raise SystemExit(
+            f"--batch-size 只支持 1（收到 {args.batch_size}）：Qwen3.5 混合架构对 pad 前缀"
+            "敏感，多样本批的 padding 会改变打分；依据见 docs/prm_training_plan.md §14.2")
     report = probe(
         model, dev, out,
         n_samples=args.n_samples or eval_cfg.get("probe", {}).get("n_samples", 500),
         seed=eval_cfg.get("probe", {}).get("seed", 42),
         pairs=parse_pairs(args.verdict_pairs),
-        batch_size=args.batch_size or eval_cfg.get("batch_size", 8),
+        batch_size=args.batch_size or eval_cfg.get("batch_size", 1),
         max_length=args.max_length or train_cfg.get("max_length", 16384),
         device=device,
         attn_implementation=args.attn or "sdpa",
