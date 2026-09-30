@@ -165,6 +165,10 @@ docker build -t codeagentrl-agent:ubuntu24 -f agent/Dockerfile .
 
 完整清单与逐项说明见 `.env_template`。
 
+> **换机器 / 换卡迁移**：代码在 GitHub，数据与产物（`outputs/`）、基座模型、`.env`、flash-attn 轮、
+> Docker 镜像都不在仓库里，需要手工搬。清单、打包命令与验收步骤见 **`docs/migration_guide.md`**，
+> 迁移后跑 `bash scripts/check_migration.sh` 自检（退出码 0 即必选项全通过）。
+
 ## 6. 快速开始（A800）
 
 ```bash
