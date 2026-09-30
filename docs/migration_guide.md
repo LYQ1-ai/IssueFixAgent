@@ -35,7 +35,7 @@ cd CodeAgentRL && git log --oneline -1        # 期望 ff1c6f8
 
 ## 2. B 类：必须手工迁移（gitignored）
 
-### 2.1 最小可跑（≈0.9 GB）——只做评估 / 续训 / 下游筛选
+### 2.1 最小可跑（outputs 部分 ≈0.86 GB；另需 flash-attn 轮 233 MB + 基座模型 8.8 GB）——只做评估 / 续训 / 下游筛选
 
 | 路径 | 体积 | 用途 | 不迁的后果 |
 | --- | --- | --- | --- |
@@ -51,7 +51,7 @@ cd CodeAgentRL && git log --oneline -1        # 期望 ff1c6f8
 > `runs/m4-v1/` 若只想搬"能评估"的最小集：`model.safetensors` + `adapter_config.json` +
 > `tokenizer*.json` + `chat_template.jinja`（约 110 MB，`checkpoints/` 可省）。
 
-### 2.2 完整可重建（再 +6.7 GB）——还需要重跑 `build_dataset`
+### 2.2 完整可重建（再 +5.8 GB）——还需要重跑 `build_dataset`
 
 | 路径 | 体积 | 用途 |
 | --- | --- | --- |
